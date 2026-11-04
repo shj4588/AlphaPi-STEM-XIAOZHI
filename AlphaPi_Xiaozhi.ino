@@ -181,7 +181,9 @@
  *   h=重发 hello  1/0=手动 listen start/stop  w=配置网页(开/关)
  *   a=联网核对激活状态（写 actboot + 重启后 OTA 实查）
  *   s=紧急停止  r=重连 WebSocket  F=恢复出厂（清 NVS + 重启）。
+ *   v=详细诊断开关（每 2s 的 [DL] 链路行，默认关）。
  *   A 键长按 2s = AP 配网门户开/关（物理救援入口）。
+ *   （诊断工具 p=0x80 指针扫描默认不编译，需将 PROBE_ENABLE 置 1 —— 见下方探针块注释）
  */
 
 #include <WiFi.h>
@@ -191,7 +193,14 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <esp_heap_caps.h>   // ★V2.1.4：DMA 堆诊断（heap_caps_get_free_size / largest_free_block）
+#include <esp_sleep.h>      // ★V2.3.2：深度休眠（GPIO 唤醒，参照 PageTurner V1.0.5）
 #include <opus.h>
+
+// ================== 固件版本（唯一出处）==================
+// ★升版本只改这一行：AP 配置页标题 + 串口启动横幅都由它渲染，避免漏改。
+#define XZ_FW_VERSION "V2.3.2"
+// 实验版识别标记（正式版留空字符串 ""）：同一处渲染 —— 烧进去后一眼能认版本。
+#define XZ_FW_TAG ""
 
 // loopTask 栈：opus SILK 编码路径峰值 15-25KB，默认 8KB 必爆。
 // ★V2.1.3：48000 → 32768。依据是**实测**而非估算 —— V2.1.2 加的栈高水位打点显示，
@@ -233,6 +242,7 @@ static const int BTN_PIN = 3;  // C 键，低有效（板上外部下拉，按�
 static const int BTN_A_PIN = 10;
 static const int BTN_B_PIN = 1;  // B 键：短按打断播放
 static bool btnAHeld = false;
+static bool btnALong = false;  // ★V2.2.2：本次按下已判为长按（松开时不再当单击）
 static uint32_t btnAAt = 0;
 
 WebSocketsClient ws;
@@ -262,6 +272,14 @@ static uint32_t cfgRebootAt = 0;    // 保存 WiFi 后延时重启
 // 60s 主动断是服务器不踢时的兜底，防连接泄漏）
 static const uint32_t IDLE_DISCONNECT_MS = 60000;
 static uint32_t lastConvAt = 0;  // 最近会话活动时刻：空闲 60s 主动断开（按需连接架构）
+
+// ---- ★V2.3.2 深度休眠（参照 PageTurner V1.0.5 的 1.0.5 实现）----
+// C3 深睡只有 RTC GPIO(0~5) 能当唤醒源：C=GPIO3 ✓（A=GPIO10 不行，B=GPIO1 可但用户只要 C）。
+// 深睡唤醒 = 整机复位重启（setup 重跑、WiFi 重连），所以醒来后靠 wakeByCKey 标志，
+// 在 setup 末尾若 C 仍按住就直接 startTalk() —— 与待机"按住 C 说话"完全一致。
+#define SLEEP_IDLE_MS 60000UL    // ★用户指定：60 秒无动作即入深睡（改这里；0 = 不休眠）
+static bool wakeByCKey = false;      // 本次启动由 C 键从深睡唤醒
+static uint32_t lastVolActAt = 0;    // 音量键也算"交互"，避免调着音量突然睡
 
 // 上行状态机：0=空闲 1=录音中（停止为阻塞式，无需中间态）
 static uint8_t recPhase = 0;
@@ -409,7 +427,10 @@ static const uint8_t REC_POLL_H0 = 0x80;
 static const uint8_t REC_POLL_H1 = 0x11;
 static const uint32_t RESP_TIMEOUT = 100;
 static const uint8_t MAX_RETRIES = 3;
-static const size_t PLAY_CHUNK = 200;
+// ★V2.2.0：200 → 160。协控 UART RX 一次能吃下 128~192B（One 板实测 short ack
+// 120/124/190 for 200 bytes），200B 帧必短收 → 多一次往返 → 吞吐腰斩。
+// 160B 落在它的整帧吸收区间内，一帧一次确认，RTT 只由 UART 传输决定。
+static const size_t PLAY_CHUNK = 160;
 
 // 阻塞发一帧并等 3 字节响应 [0x91, addr, status]（含官方重发）
 // ★硬校验 resp[1]==frame[1]（addr 回显）：总线上有多类帧（音频 0x10/0x15、点阵 0x08）
@@ -487,8 +508,15 @@ static void buildWavHeader44() {
 static const uint16_t DL_SIZE = 20480;  // 20KB≈853ms@24000，容纳 880ms 起播预滚（按容量钳制）
 // 本地服务器 TTS 逐帧发送不均，FIFO 平滑供给；满时丢最老（延迟保护）
 static uint8_t dlFifo[DL_SIZE];
-static uint16_t dlHead = 0, dlTail = 0;
+// ★V2.2.1 关键修复：指针必须 32 位。
+// 旧代码是 uint16_t，`dlFifo[dlHead++ % DL_SIZE]` 在 dlHead 从 65535 回到 0 时，
+// 索引从 65535%20480=4095 直接跳到 0 —— 读/写位置瞬间错开 4095 字节，
+// 于是每 65536 字节（65536/24000 = 2.7307 秒）必卡一下，和用户听到的
+// "每 2.73 秒卡一下"完全对上。DL_SIZE=20480 不是 65536 的约数，所以回绕不连续。
+static uint32_t dlHead = 0, dlTail = 0;
 static uint32_t dlOver = 0;           // FIFO 溢出丢样计数
+static uint32_t dlMbGate = 0;         // ★实验①：因"协控水位未降下来"而本圈跳过投喂的次数
+                                      //   （批式节拍证据：>0 说明泵真的在等协控播掉）
 static uint32_t dlStarvePrintAt = 0;  // 断粮周期打印节拍（每 2s 一条）
 
 // ---- 生产策略（v8.2 低水位 + 饿透即重启 + v9.5.3 死亡指纹复活）----
@@ -497,7 +525,115 @@ static uint32_t dlStarvePrintAt = 0;  // 断粮周期打印节拍（每 2s 一�
 //   ③ 会话硬顶 120s 只作保险丝（EXP21 单会话 30s 零异常，正常故事永不触发）；
 //   ④ 播放冻结指纹（积压增速 >8000 B/s 连续 2 次）→ 0x10+推头直启复活。
 static const uint32_t DL_SEG_HARD_MS = 120000;  // 会话硬顶兜底（保险丝）
-static const uint32_t DL_JITGATE_MS = 880;      // 起播门槛 ms（起播延迟 +0.2s~0.9s）
+
+// ================== ★实验①：官方微批"浅水位"复刻（2026-10-10）==================
+// 命题（依据官方 controlBoard.mpy 反汇编 `官方音频机制_反汇编还原.md`）：
+//   官方播放 = 200B/批 + 在途 ≤1 批 + **协控缓冲几乎不积压**（浅水位）。
+// 我方现状核查：帧长 PLAY_CHUNK 已是 200B、在途已锁 1 帧（dlPendCnt>=1 即等 ACK）
+//   ⇒ 这两项**本来就与官方同构**，不需要改。真正"重"的只剩**水位**：
+//   起播预滚 880ms（≈21KB 一次性塞进协控）+ 积压钳制 4600ms + 回填目标 1500ms。
+// 本开关把水位从"千毫秒级"压到官方批大小量级（200ms），复刻度 = **水位维度**。
+// 变量：只动 DL_JITGATE_MS 与 DL_AHEAD_MAX_MS 两项（帧长/在途/流控/饿透复位策略不动）。
+// 回退：DL_EXP1_WATER 改 0 即回 V2.1.5 原行为（无需恢复备份）。
+// 观察判据：①段界复位次数 dlSegResets ②溢出丢样 dlOver ③断粮频率 ④听感吞字有无变化
+//   —— 若四者与 V2.1.5 完全一致 ⇒ "水位/批大小"假说被否，转手段④（0x80 扫描协控指针）。
+// ★EXP1 实测判决（2026-10-10，用户放歌）：**仍重播 ⇒ 假说否**。且这是物理必然——
+//   写指针在环内的"位置"只由累计写入量决定，与在途深浅无关（详见 EXP2 说明）。
+//   保留 200ms 水面作为 EXP2 的基线配置（分段才是 EXP2 的唯一自变量）。
+// ★EXP4 起关闭（2026-10-10 晚，用户"直接试 4"）：EXP1 浅水位已证伪、EXP2/EXP3 未验证但
+//   会**每 2.4s 主动复位一次** ⇒ 协控播放指针被反复推头重置 = 手段④的时序观测被污染。
+//   试手段④必须回到**连续播放**基线（V2.1.5：只有 120s 保险丝），才能看到寄存器单调性。
+//   两个开关同时置 0 = 纯 V2.1.5 播放行为 + 探针，变量最干净。
+#define DL_EXP1_WATER 0
+// ================== ★V2.1.6：应答锁速（ACK-LOCK）==================
+// 【为什么加这一版】2026-11-04 在 AlphaPi One（**同款协控**，ESP-IDF 移植版）上把
+//   "吞字/卡顿"彻底修好了，做法是把播放内核换成三条铁律（2680~2710 实测通过，
+//   用户 60 秒长故事验收"没听出吞字"）：
+//     ① **只按协控的 ACK 走**：发 200B → 等 `91 15 <实收字节>` → 收到才发下一块，
+//        status 说收了多少就前进多少、剩下补发（=本固件已有的 1 帧在途语义）；
+//     ② **喂进协控的在途积压压到极浅**（几十毫秒量级），绝不按墙钟建模、绝不重锚；
+//     ③ **中途绝不重推 44 字节 WAV 头**（= 绝不在语音里插会话复位）。
+// 【与本固件 V2.1.5 的差异（就是要改的三处）】
+//     ① 投喂水位上限 4600ms ⇒ 压到 120ms。协控环 65536B=2.73s，积压在途越多，
+//        写指针绕圈时"跨过的未播数据"越多；AlphaPi One 上同样协控、积压≈0，
+//        连续 60s 零异常 ⇒ 先把这个变量压到同一量级再谈别的。
+//     ② 120s 硬顶兜底会在故事中途做一次"饿透复位 + 重推头"⇒ 本开关下关闭
+//        （连续流不该有段界；README 自己的 A/B "开复位 6 次 ⇒ 命中 6 处重播"
+//        已经说明复位缝本身就是重播源）。
+//     ③ 协控连续 6 次 ACK 超时（≈600ms 完全不吃数据）不再直接判死收场，改为
+//        **重开会话**（0x10 + 推头），最多 3 次 —— 长故事不会因为一次僵死被截断。
+// 【起播门槛为什么是 300ms】本机服务器句间停顿实测 150~350ms，门槛必须 ≥ 停顿
+//   才不至于每句都饿透（饿透就要重推头 = 一次缝）。300ms 同时把起播延迟控制在
+//   0.3s 量级；稳态上限 120ms 由 ACK 决定，二者不冲突（门槛只在起播/复供时用）。
+// 【回退】PLAY_ACK_LOCK 改 0 ⇒ 完全回到 V2.1.5 行为（880/4600 + 120s 硬顶 + 30 次判死）。
+#define PLAY_ACK_LOCK 1
+#if PLAY_ACK_LOCK
+static const uint32_t DL_JITGATE_MS = 300;    // 起播/复供门槛（吸收句间 150~350ms 停顿）
+// ★V2.1.7：积压上限 120ms 实测过浅（见 V2.1.6 日志：全程欠供、断粮 4 次、
+// 152790B 播了 8918ms = 17132B/s，比实时 24000 慢 29% ⇒ 听感拖长+卡顿）。
+// 但 4600ms 又超过协控环 2730ms ⇒ 绕圈覆盖未播数据（README 的重播假说）。
+// 取 700ms：环长的 1/4 以内，又足够吸收帧级抖动。真正的吞吐问题由
+// DL_INFLIGHT_MAX 修（单帧在途 = 吞吐被 ACK 往返钳制在 frame/RTT）。
+static const uint32_t DL_AHEAD_MAX_MS = 700;
+#elif DL_EXP1_WATER
+static const uint32_t DL_JITGATE_MS = 200;    // 原 880：起播预滚 21KB → 4.8KB
+static const uint32_t DL_AHEAD_MAX_MS = 200;  // 原 4600：投喂水位上限（协控在途积压封顶）
+#else
+static const uint32_t DL_JITGATE_MS = 880;    // 起播门槛 ms（起播延迟 +0.2s~0.9s）
+static const uint32_t DL_AHEAD_MAX_MS = 4600;
+#endif
+// ================== ★实验②：主动定量分段（复刻官方 2.5s 任务边界，2026-10-10）==================
+// 【EXP1 实测结案：放歌仍重播 ⇒ "水位/批大小"不是根因】
+//   物理原因：写指针在环内的**位置**只由"距上次推头的累计写入量"决定，与在途深浅（水位）无关
+//   ⇒ 浅水位改不了绕圈这件事。环长 65536 样本 = 2.73067s @24k，写指针每绕一圈必重播一次。
+// 【真正的缺口：现有复位触发器对"连续流"零覆盖】
+//   ①饿透标记/恢复推头：需 FIFO 空 + 积压 ≤50ms  ⇒ 连续流从不断供 ⇒ 永不触发；
+//   ②死亡指纹复活：需积压增速 >8000 B/s（播放冻结）⇒ 正常播放不触发；
+//   ③会话硬顶：DL_SEG_HARD_MS = **120s** 才兜底 ⇒ 这 120s 里写指针已绕 44 圈！
+//   ⇒ 连续音乐 = 从头到尾没有一次分段 ⇒ 每 2.73s 重播一次。这就是"放歌还是重播"的完整解释。
+// 【官方为什么没事】官方 2.5s/段（< 2.73067s）**每段必然结束任务**，开局重发启动
+//   ⇒ 写指针永远走不到 65536 样本 ⇒ 从不绕圈。分段=规避绕圈的手段，绕圈=坏在固件里的 bug。
+// 【本实验】把"段界"从 120s 硬顶改成 **定量主动分段**：距上次推头的字节数达到
+//   DL_EXP2_SEG_MS（默认 2400ms，环长 2730.67ms 的 88%，留 330ms 余量）即主动进入既有的
+//   "停发 → 饿透 → 推头 → 复供"状态机。停发期协控还在播自己缓冲里的货（不出声=不损失），
+//   真正的静音只有"播空到新头到货"那一小段 = 由 DL_EXP2_DRAIN_MS 余量决定（原硬编码 100ms）。
+// 变量：只动"段界触发条件"+"饿透判据余量"两项；帧长/在途/流控/水位（EXP1）一律不动。
+// 回退：DL_EXP2_SEG 改 0 ⇒ 回到"只有 120s 硬顶"的 V2.1.5 原行为。
+// 【EXP2b/EXP3 修正（2026-10-10 晚，用户实测 EXP2 仍重播）】
+//   ① 门：去掉 !dlFeedDone/!ttsDone —— 点歌时服务器会在播放中发 tts stop，旧门把分段锁死。
+//   ② ★同源铁证：2026-09-30 A/B 实测「开复位 6 次 ⇒ 命中 6 处（每次复位必 1 处重播）」，
+//      而关复位绕 7.4 圈只命中 3 处 ⇒ **复位缝本身就是重播源**。EXP2 每 2.4s 切一次
+//      = 每 2.4s 制造一次重播 ⇒ 比绕圈（2.73s/40%）更密。
+//   ③ EXP3 对策 = 段末静音垫：既然重放的总是"缝前区域"，就把缝前 200ms 换成数字静音
+//      ⇒ 重放的是静音 ⇒ 重播变"顿一下"。DL_EXP2_PAD_MS 改 0 即回无垫对照。
+#define DL_EXP2_SEG 0
+#if DL_EXP2_SEG
+static const uint32_t DL_EXP2_SEG_MS = 2400;    // 段长（必须 < 2730.67ms = 环长）
+static const int32_t DL_EXP2_DRAIN_MS = 20;     // 饿透判据余量（原 100ms：硬等积压 -100ms）
+// ★EXP3（2026-10-10 晚）：段末静音垫——实测每个"复位缝"= 1 处重播（2026-09-30 A/B：6 复位 6 命中），
+//   机制是协控重生时"重放缝前区域"。若把缝前那 150~170ms 换成数字静音，重放的就是静音 ⇒ 重播消失
+//   （代价：换成一次等长静音，听感"顿一下"而非"重复一句"）。
+//   实现：先按 DL_EXP2_AUDIO_MS 走音频，再推 DL_EXP2_PAD_MS 静音并把 FIFO 抽干，最后才切段。
+//   DL_EXP2_PAD_MS 改 0 = 回到 EXP2（无垫直切，用于对照）。
+static const uint32_t DL_EXP2_AUDIO_MS = 2200;  // 音频段长（垫 200ms 后合计 ≈2400ms）
+static const int32_t DL_EXP2_PAD_MS = 200;      // 段末静音垫长度（0=关）
+// ★EXP3a 天然静音优先：段内已连续 ≥180ms 静音（帧内 max|v−128| 低）就直接切——这段静音
+//   本身就是"缝前区域"，重放的是它 ⇒ **零代价**（不用多切 200ms 垫）。垫静音只是没天然静音时的替身。
+static const uint32_t DL_EXP2_QUIET_MIN_MS = 1500;   // 过早不切（防切碎）
+static const uint32_t DL_EXP2_QUIET_RUN_MS = 180;    // "缝前静音"长度（≥150~170ms 的重放窗口）
+static uint32_t dlExp2Segs = 0;                 // 实验②：主动分段触发次数
+static uint32_t dlExp2StopSum = 0;              // 实验②：累计停发时长（算平均）
+static uint32_t dlExp2StopMax = 0;              // 实验②：单次最长停发
+static bool dlPadDone = false;                  // ★EXP3：本段静音垫是否已入队
+static uint32_t dlPadAtMs = 0;                  // ★EXP3：静音垫入队时刻（抽干超时兜底）
+static uint32_t dlExp2Quiet = 0;                // ★EXP3a：缝落天然静音的段数（零代价的那部分）
+// ★EXP2b 绕圈探针（判"分段到底有没有生效"的硬指标）
+static uint32_t dlSegMaxMs = 0;                 // 本场最长段长（>2730 ⇒ 绕圈已发生）
+static uint32_t dlWrapCross = 0;                // 本场越过环长仍未分段的次数
+static bool dlWrapAlarm = false;                // 告警自武装（段内推量回落 <1s 即重新武装）
+#else
+static const int32_t DL_EXP2_DRAIN_MS = 100;    // 原硬编码值
+#endif
 // ★V2.0.9 兜底分级：旧版一把尺子（静默 >5000ms 就 endDlPlay"流结束兜底"）在两种
 //   场景下都错——① 服务器真挂了：WS 断开事件几秒内必到，多等纯属浪费；
 //   ② 服务器只是长句 LLM 间隙（本地服务器实测可到 5s+）：判死 = 整段故事被丢，
@@ -592,6 +728,7 @@ static bool ttsDone = true;         // 服务器 tts state=stop 已到（流结�
 // （健康流实测恒 0 超时）→ 主动 endDlPlay 收场，防"泵空转 + 服务器踢连接"不可恢复态
 static uint8_t dlToStreak = 0;
 static const uint8_t DL_TO_STREAK_MAX = 30;  // ≈3s（RESP_TIMEOUT=100ms × 30）
+static uint8_t dlRestarts = 0;               // ★V2.1.6：本场"协控无应答 → 重开会话"次数
 
 // ---- 头前置队列：44B WAV 头必须先于一切 PCM 上线（中途头=会话杀手）----
 static uint8_t dlPre[44];
@@ -626,10 +763,118 @@ static uint8_t dlPay[PLAY_CHUNK];
 //   但四档实测吞吐全部 ≈24000（=协控接收速率=物理瓶颈），Q=1 与官方同构、发隙最小
 //   ⇒ 生产锁定 1 帧在途。
 #define DL_PIPE_MAX 4
+// ★V2.1.7：在途帧数 1 → 3。历史注释说"四档实测吞吐全部≈24000"，但 V2.1.6 日志
+// 实测全场只有 17132 B/s（152790B / 8918ms，实时 24000），正是吞吐被 ACK 往返
+// 钳制在 200B/RTT ≈ 17KB/s 的直接证据：单帧在途时，泵每圈最多发 1 帧，主循环
+// 40~150 圈/s ⇒ 上限 8~30KB/s，卡在实时线附近，抖一抖就欠供 ⇒ 断粮/拖长。
+// 3 帧在途把上限抬到 ~50KB/s，节拍仍由积压水位（DL_AHEAD_MAX_MS）控制。
+// ★V2.2.0：3 → 1，回到 One 板的"一帧一确认"语义。
+// 证据（V2.1.11 日志）：短收 526~583 次 / 3.4s（≈150 次/s），stmin=4，
+// 即 200B 的一帧平均要 11 次往返才送完，每次 RTT 8ms ⇒ 每帧 ~88ms ⇒ 13 帧/s。
+// 三帧在途时协控 UART RX 被连续灌满，它每次只能腾出几十字节 ⇒ 短收自我放大；
+// 而短收后的尾巴进 rtx 抢先发，插在在途帧之后 ⇒ 音频字节乱序 ⇒ 卡顿。
+// 一帧在途 + 帧长 160（< 协控 RX 缓冲 128~192B 的整帧吸收区间）⇒ RTT 只由
+// UART 传输决定（160B@460800 ≈ 3.5ms），吞吐上限 160B/6ms ≈ 26KB/s，够实时。
+#define DL_INFLIGHT_MAX 1
 static uint8_t dlPendLen[DL_PIPE_MAX];  // 在途帧请求长度
 static uint8_t dlPendGot[DL_PIPE_MAX];  // 在途帧已确认接收长度
 static uint32_t dlPendAt[DL_PIPE_MAX];  // 在途帧发送时刻（超时判据）
 static uint8_t dlPendCnt = 0;           // 当前在途帧数
+static volatile bool dlWantStart = false;  // ★V2.2.0：回调只挂"该起播了"，起播动作交给泵任务
+// ★V2.2.3 音量：A 单击 -，B 单击 +（原来 B 的"打断"取消，打断统一走 C）。
+// 协控音量寄存器 0x14 直接收 0..100（One 板同款 N32，逆向 n32_audio.py 的 set_volume）。
+// ★档位：5x5 点阵 = 25 像素 ⇒ 1 像素 = 1 档，25 档。
+// ★★关键（2026-11-04 实测纠正）：STEM 这颗 N32 的 0x14 只认 **0..6 硬件档**，
+//   不是 One 板的 0..100！发 96/88/80 全被它钳成 6 ⇒ 用户听感"调音量没影响"。
+//   所以：25 个 UI 档 = 硬件 1..6 粗档 + 软件增益细调（只衰减，不放大，不会削波）。
+//   PageTurner 项目记忆佐证：0x14 payload 0-6，volume%→min(6, v*6/100)。
+static const uint8_t CMD_VOLUME = 0x14;
+// ★★V2.2.8 定案（依据 PageTurner 9 月逆向笔记，血证）：
+//   「0x14 = 音量指令，payload 0~6 硬件档，volume% → min(6, v*6/100)；发 00 = 静音；
+//     0x14 只起播发一次，绝不重发 —— 会话级指令反复进流会打烂协控解析。」
+//   所以档位就是**硬件真实 6 档**（1..6，0=静音不开放），不做软件增益（会抬底噪），
+//   也绝不 0~100、0~6 乱映射（V2.2.6 发 4、V2.2.7 发 40 都被当垃圾丢掉 ⇒ "按了没反应"）。
+//   下发时机也固定：只在 startDlPlay() 的起播序列里、0x10/00 停录之前发**一次**。
+static const uint8_t VOL_LEVELS = 6;   // 硬件真实档位（= 点阵点亮像素数）
+static const uint8_t VOL_MIN_LV = 1;   // 最低 1 档（1/6 ≈ 17%），0 = 静音不开放
+static const uint8_t VOL_MAX_LV = 6;   // 满档
+static const uint8_t VOL_DEF_LV = 6;   // 默认满档（与 2.2.1 的听感一致）
+static uint8_t volLevel = VOL_DEF_LV;  // 已应用的档位
+// ★V2.2.9：播放中也刷柱状图，但**合并 + 限流**：
+//   V2.2.4 的教训不是"不能画"，而是"连按 5 次就连发 5 帧点阵"——协控渲染任务排队，
+//   3 秒不应答 PCM ⇒ 看门狗收场（"播着播着没声了"）。
+//   所以这里改成：按键只记账，停止按 70ms 后才发一帧；两帧之间至少间隔 140ms；
+//   播放中走 mtxSendFast（9 字节即走，不等渲染 400ms）。
+#define VOL_ICON_IN_PLAY 1
+#define VOL_ICON_MS 1200        // 柱状图显示时长，之后恢复状态图标
+#define VOL_ICON_DEBOUNCE 70    // 连点合并：最后一次按键后 70ms 才刷屏
+#define VOL_ICON_MIN_GAP 140    // 两帧柱状图最小间隔（防协控渲染排队）
+static uint8_t volTarget = VOL_DEF_LV;      // 按键目标档位
+static volatile bool volPending = false;    // 有新的目标档位待落地
+static volatile uint8_t volAckLast = 0xFF;  // 音量命令应答（0xFF=尚未收到）
+static volatile bool coCmdBusy = false;     // 泵任务正在写命令帧（仅诊断用）
+static uint8_t volHwStep = 0xFF;            // 已下发给协控的硬件档（0xFF=未知），仅诊断用
+static bool volSaveDirty = false;           // 音量待落盘（NVS 写会卡 10~40ms，不能放在播放中）
+static uint32_t volSaveAt = 0;
+static uint32_t volIconAt = 0;              // 音量柱状图显示起点（VOL_ICON_MS 后恢复状态图标）
+static bool volShowPend = false;            // 待刷柱状图（连点只保留最后一次）
+static uint32_t volShowAt = 0;              // 最后一次按键时刻（去抖基准）
+static uint32_t volShowSentAt = 0;          // 上一帧柱状图发出时刻（限流基准）
+static bool volPushPend = false;            // 播放中待下发 0x14（在帧间隙发，绝不插进在途帧）
+
+// ★★V2.2.8：档位**就是硬件值**，直接 1..6，不做任何映射。
+// 教训链：V2.2.5 发 72~100（越界）→ 全被钳成 6 或丢弃 ⇒ "没影响"；
+//         V2.2.6 按 0..6 发 4 ⇒ 用户"没声音"；V2.2.7 发 40（越界）⇒ "按了没反应"。
+//         根因统一：0x14 只认 0..6，且**播放中反复发会被丢弃/打乱解析**。
+static inline uint8_t volHwOf(uint8_t lv) {
+  if (lv < VOL_MIN_LV) lv = VOL_MIN_LV;
+  if (lv > VOL_LEVELS) lv = VOL_LEVELS;
+  return lv;  // 1..6 原样下发
+}
+// 泵让路标志已删除：V2.2.3 起音量/图标帧都由泵任务自己发（单一写者），不需要暂停泵，
+// 也不需要清 RX（清 RX 会把在途 PCM 应答一起吃掉 ⇒ 重发风暴 ⇒ 调音量时断流）。
+static volatile bool dlPumpBusy = false;   // 泵正在执行（仅任务外层置位，诊断用）
+static uint32_t dlShortAcks = 0;        // ★V2.1.7：短收次数（协控只吃下部分字节）
+static uint32_t dlShort2s = 0;          // 最近 2s 的短收次数
+static uint32_t dlSentDbgPrev = 0;      // 2s 喂送速率统计基准
+// ★V2.1.9 诊断：入流节奏。rxgap max = 相邻两个下行音频包的最大间隔。
+//   小（~45ms）且均匀 ⇒ 服务器按帧稳定发，我们也是及时收的；
+//   大（>300ms）+ 成串到达 ⇒ 服务器按句 burst 且合成慢 ⇒ 欠供是上游。
+static uint32_t dlRxGapMax = 0, dlRxGapAt = 0;
+static uint16_t dlGapHist[5] = {0};   // 帧间隔分布：<20/<40/<80/<160/≥160ms
+static uint32_t accWsUs = 0, accPumpUs = 0;  // ★V2.1.11 一圈耗时归因
+static uint8_t dlAckDbg = 0;            // 前 12 条原始应答样本
+static uint32_t dlAckNo = 0;            // 应答总数（★V2.1.8：稳态每 200 条抽样一次）
+static uint8_t dlStMin2s = 255;         // 最近 2s 内最小的 st（判协控限流程度）
+// ★V2.1.8 ARQ：每帧 payload 副本 + 独立重发缓冲。
+// 旧写法短收时 `dlTail -= 未确认字节`（退回 FIFO 读指针）。在途=1 时这是对的；
+// 但在途 3 时读指针早已越过后面 2 帧，退回位置落在**最新帧**身上 ⇒
+// 前帧尾巴丢失 + 最新帧尾巴被重复播（每帧一次，听感=毛刺/吞字）。
+// 正确做法：帧内容留在副本里，未确认尾巴进重发缓冲，优先于新数据发出。
+static uint8_t dlPendBuf[DL_PIPE_MAX][PLAY_CHUNK];  // 在途帧 payload 副本
+static uint8_t dlRtx[PLAY_CHUNK * DL_PIPE_MAX];     // 重发缓冲（未确认尾巴）
+static uint16_t dlRtxLen = 0, dlRtxOff = 0;
+static uint32_t dlRtxOverflow = 0;
+
+// 未确认尾巴入重发缓冲（顺序追加；满了说明链路严重欠收，丢新到的计溢出）
+static void rtxPush(const uint8_t* p, uint16_t n) {
+  if (n == 0) return;
+  if ((uint16_t)(dlRtxLen + n) > sizeof(dlRtx)) {
+    // 缓冲区压缩：丢掉已发走的头部，腾空间
+    if (dlRtxOff > 0) {
+      uint16_t keep = (uint16_t)(dlRtxLen - dlRtxOff);
+      memmove(dlRtx, dlRtx + dlRtxOff, keep);
+      dlRtxLen = keep;
+      dlRtxOff = 0;
+    }
+    if ((uint16_t)(dlRtxLen + n) > sizeof(dlRtx)) {
+      dlRtxOverflow++;
+      return;
+    }
+  }
+  memcpy(dlRtx + dlRtxLen, p, n);
+  dlRtxLen += n;
+}
 
 // 解码统计（2s 汇总打印后清零）
 uint32_t dlFrames = 0, dlBytes = 0, dlDropped = 0, dlDecErr = 0;
@@ -640,6 +885,250 @@ static int16_t decBuf[DEC_BUF_SAMPLES];
 
 static void endDlPlay(const char* why);
 static void stopDlPlayHard();
+
+// ================== ★手段④：0x80 寄存器扫描探针（2026-10-10）==================
+// 【为什么做】绕圈根因 = 写指针越过环尾 65536 样本后，协控读指针错位 150~170ms
+//   ⇒ 吞字/重播（错位点固定在环位置 45952）。EXP1/EXP2/EXP3 三轮全部落在"盲写"
+//   框架里 —— 我们不知道协控此刻播到哪、缓冲还剩多少、写指针在环内什么位置。
+//   若协控内部存在"播放进度 / 写指针 / 剩余量"这类**可读寄存器**，绕圈就能从
+//   "事后听出来"变成"事前刹车"（闭环控制），这是**唯一不依赖厂商升级固件**的根治路径。
+// 【依据】官方 controlBoard.mpy 反汇编（官方音频机制_反汇编还原.md，高置信）：
+//   uart_read(addr,n) 帧 = [0x80, addr, n]（3 字节，**无 ck**）；
+//   回包 = 4+n 字节（"3 头 + n 数据 + 1 ck"），数据在 r[3:3+n]。
+//   ★头 3 字节的**具体内容反汇编并未确证**；官方只对 addr=0x11 用它拉录音数据。
+// 【★第一版翻车记录（2026-10-10 夜，务必记住）】v1 按 `[0x91, addr, n]` 严格匹配滑窗收包，
+//   实测：敲 p 后 A 阶段**一行都不打印**（只有启动两行 + 播放照常继续）—— 这**不是协控
+//   没反应**，而是"我不认识它的回包，全当无响应丢了"：回包头大概率不是 0x91。
+//   ⇒ 教训（与既有铁律一致：先数线上字节、再立协议假设）：**本版改为原始抓包**——
+//   不解析、不假设、收到什么就打印什么。先拿到原始字节，再回头定协议。
+//   ⇒ 教训（与既有铁律一致——**先数线上字节，再立协议假设**）：改为**原始抓包**，
+//   不解析、不假设、收到什么就打什么。先拿到原始字节，再回头定协议。
+// 【★第二版实测（2026-10-10 23:10，EXP4b抓包版，用户日志）】**格式完全破译**：
+//   ★读回包 = [0x81, addr, len, data[len], ck]，ck = (0x81+addr+len+Σdata)&0xFF ★
+//     证据：A 01 → `81 01 04 00 00 00 00 86`（ck=81+01+04=0x86 ✓）；A FF → 逐字节吻合 ✓
+//   ★256/256 全部应答（4588ms）⇒ **0x80 读通道完全开放**；v1 翻车只因我猜了 0x91。
+//   ★addr 是**内存偏移**（不是寄存器号）：回包给的是"内存 [addr, addr+4) 窗口"。
+//     铁证 = 0xED..0xFF 逐地址 1 字节步进地滑出同一段连续字节流：
+//       mem[ED..FF] = 00 00 00 B5 D0 60 01 | 5A 45 52 4F 20 44 65 63 20 32 31 20 20 38 31
+//                                          "Z  E  R  O  ' ' D  e  c  ' ' 2  1  ' ' ' ' 8  1"
+//     ⇒ 一片 ROM 里的构建字串 "ZERO Dec 21  81"（前 7 字节 00 00 00 B5 D0 60 01 为二进制头）。
+//     另见非零：mem[12]=06、mem[14]=05（相隔 2，疑两个 uint16 计数）；其余 0x00..0xEC 全零。
+//   ★代价（决定性）：**0x80 读会抢协控 UART、干扰 0x15 写**。B 阶段每 250ms 一读
+//     ⇒ 播放 ACK 大面积丢失 ⇒ 30 次超时看门狗反复收场 ⇒ "起-死-起-死"螺旋
+//     （日志连发 `播放结束(协控不应答): 1400 字节 / 3137 ms` 即此）。A 阶段高频读反而
+//     没打死（写帧的 ACK 重发机制能吸收），但**不可依赖**。
+//   ⇒ **判定：手段④关闭。** 两条理由都成立：①256 地址里没有随播放变化的进度/指针
+//     寄存器（B 轮所有表面 Δ 全是 ACK 串扰假象，真候选地址重扫值恒定）；
+//     ②"边播边读"的闭环物理上不可行（读会打断播放）。根治仍只剩厂商升级协控固件。
+// 【第三版（EXP4c）—— 只做"低成本复验"的准备，默认不主动跑】：
+//   ①解析化：用已破译格式 probeExtract() 取数据段，不再刷 256 行原始字节；
+//   ②A 阶段**先收集后汇总**，只打印数据非零的地址（256 行 → 几行，含进度行防"以为卡住"）；
+//   ③B/C 阶段**只扫非零地址**（个数由 256 降到个位数 ⇒ 干扰时长 64s → 2s 级）；
+//   ④B 间隔 250→400ms、读前清 RX 残留（进一步降串扰）；
+//   ⑤保留 probeSniff 原始抓包（将来格式再变时可直接复用）。
+// 【安全】①只在串口命令触发后运行，默认零开销（loop 里一次判空返回）；
+//   ②每个地址 = 一个"发-收原子事务"（发送后立即在本函数内轮询收完，绝不与
+//     pumpPlay() 的 ACK 结算交错）；③抓包前清 RX 残留（pumpPlay 刚结算完 ACK）；
+//   ④★放歌中跑探针会打断播放（见上）——要中止就再敲一次 p / 敲 s。
+// 【用法】串口敲 `p` ⇒ 三阶段全自动：
+//   A 全表读 addr 0..255（reqLen=4，窗口 8ms）→ 汇总打印非零地址
+//   B 隔 400ms 对非零地址重扫 → 打印 前4B -> 后4B，值变了标 Δ
+//   C 对 Δ 的地址每 180ms 采一次 × 20（3.6s > 环长 2.73s）→ 打曲线
+// 【★状态：整块默认关闭（2026-10-10 收口）】手段④判定关闭（格式已破译，但①无进度
+//   寄存器 ②读会打断播放）。探针占 **2.6KB 静态 RAM**（probeDat/probeV2 各 1KB + 两张 256 表），
+//   播放期堆余量只有十几 KB ⇒ 生产版必须不编译它。要复跑：`PROBE_ENABLE` 改 1 重编译即可，
+//   代码与全部历史记录（含原始抓包 probeSniff）完整保留在本块内。
+#define PROBE_ENABLE 0
+#if PROBE_ENABLE
+static uint8_t  probePhase = 0;      // 0=空闲 1=A全表读 2=B重扫 3=C时序
+static uint16_t probeAddr = 0;       // 当前地址游标
+static uint32_t probeNextAt = 0;     // 下一次动作最早时刻（ms）
+static uint32_t probeT0 = 0;         // 本轮启动时刻（ms）
+static uint8_t  probeLen[256];       // 该地址回包数据段长度（解析出的 len）
+static uint8_t  probeDat[256][4];    // 该地址数据段（A 轮基准）——复用原 probeV1
+static uint8_t  probeHas[256];       // 数据非零 ⇒ 进入 B/C
+static uint8_t  probeV2[256][4];     // B 轮数据
+static uint8_t  probeChg[6];         // Δ 地址表（≤6）
+static uint8_t  probeChgN = 0;
+static uint16_t probeAckN = 0;       // A 轮有回包地址数
+static uint16_t probeValN = 0;       // A 轮数据非零地址数
+static uint8_t  probeSeqAddr = 0;    // C 阶段当前跟踪的 Δ 序号
+static uint8_t  probeSeqCol = 0;     // C 阶段采样列号
+static const uint8_t PROBE_SEQ_N = 20;   // 20 × 180ms = 3.6s（> 环长 2.73s）
+static uint8_t  probeSeq[20][4];     // C 阶段每点数据 4 字节
+
+// ★原始抓包（保留工具）：发 [0x80,addr,n]，清 RX 残留后收 winMs 内到达的所有字节（≤cap）。
+//   返回收到字节数（0 = 无任何回包）。不做任何格式假设。
+static uint8_t probeSniff(uint8_t addr, uint8_t reqLen, uint8_t* out, uint8_t cap, uint16_t winMs) {
+  while (coUart.available()) coUart.read();   // 清残留（pumpPlay 本轮已结算过 ACK）
+  uint8_t req[3] = { 0x80, addr, reqLen };
+  coUart.write(req, 3);
+  coUart.flush();
+  uint32_t t0 = micros();
+  uint32_t lim = (uint32_t)winMs * 1000u;
+  uint8_t n = 0;
+  while ((uint32_t)(micros() - t0) < lim && n < cap) {
+    if (coUart.available()) out[n++] = (uint8_t)coUart.read();
+  }
+  return n;
+}
+
+// ★解析（已破译格式 [0x81, addr, len, data[len], ck]）：滑窗定位并取数据段。
+//   返回数据字节数（≤4；0 = 没找到或没收全）。滑动是为容忍前导串扰字节。
+static uint8_t probeExtract(const uint8_t* b, uint8_t n, uint8_t addr, uint8_t* d4) {
+  memset(d4, 0, 4);
+  for (uint8_t i = 0; (uint8_t)(i + 3) <= n; i++) {
+    if (b[i] != 0x81 || b[i + 1] != addr) continue;
+    uint8_t len = b[i + 2];
+    if (len > 4) len = 4;
+    if ((uint8_t)(n - (i + 3)) < len) return 0;   // 数据没收全 ⇒ 当失败
+    memcpy(d4, b + i + 3, len);
+    return len;
+  }
+  return 0;
+}
+
+static void probeStart() {
+  probePhase = 1;
+  probeAddr = 0;
+  probeNextAt = 0;
+  probeT0 = millis();
+  probeChgN = 0;
+  probeAckN = 0;
+  probeValN = 0;
+  probeSeqAddr = probeSeqCol = 0;
+  memset(probeHas, 0, sizeof(probeHas));
+  memset(probeLen, 0, sizeof(probeLen));
+  memset(probeDat, 0, sizeof(probeDat));
+  Serial.println("[P] === 手段④ 探针 v3（解析版）：扫 addr 0..255，发 [80 xx 04]，窗口 8ms ===");
+  Serial.println("[P] 回包格式(已破译): 81 <addr> <len> <data...> <ck>，ck=(81+addr+len+Σdata)&0xFF");
+  Serial.printf("[P] 上下文: %s | 环长 2730ms\n",
+                dlActive ? "★播放中（⚠️ 读会干扰播放）" : (recPhase == 1 ? "录音中" : "空闲（无播放）"));
+  Serial.println("[P] 中止：再敲一次 p（或 P）/ 敲 s");
+}
+
+static void probeTick() {
+  if (probePhase == 0) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - probeNextAt) < 0) return;
+  uint8_t buf[12], d4[4];
+
+  // ---------- A：全表读（先收集，最后只汇总打印非零）----------
+  if (probePhase == 1) {
+    memset(buf, 0, sizeof(buf));
+    uint8_t n = probeSniff((uint8_t)probeAddr, 4, buf, sizeof(buf), 8);
+    uint8_t dl = probeExtract(buf, n, (uint8_t)probeAddr, d4);
+    if (dl > 0) {
+      probeAckN++;
+      probeLen[probeAddr] = dl;
+      memcpy(probeDat[probeAddr], d4, 4);
+      if ((d4[0] | d4[1] | d4[2] | d4[3]) != 0) { probeHas[probeAddr] = 1; probeValN++; }
+    }
+    probeAddr++;
+    if (probeAddr >= 256) {
+      Serial.printf("[P] --- A 完成：应答 %u/256，数据非零 %u 个 | 耗时 %lums ---\n",
+                    (unsigned)probeAckN, (unsigned)probeValN, (unsigned long)(millis() - probeT0));
+      if (probeAckN == 0) {
+        Serial.println("[P] ⚠️ 全表零应答 ⇒ 0x80 读通道不开放（或窗口太短）⇒ 手段④关闭");
+        probePhase = 0;
+        return;
+      }
+      Serial.println("[P] 非零地址（addr: d0 d1 d2 d3）:");
+      for (uint16_t a = 0; a < 256; a++) {
+        if (!probeHas[a]) continue;
+        Serial.printf("[P]   %02X: %02X %02X %02X %02X\n", (unsigned)a,
+                      probeDat[a][0], probeDat[a][1], probeDat[a][2], probeDat[a][3]);
+      }
+      if (probeValN == 0) {
+        Serial.println("[P] ⚠️ 全部可读地址为 0 ⇒ 无进度/指针类寄存器 ⇒ 手段④关闭");
+        probePhase = 0;
+        return;
+      }
+      probePhase = 2;
+      probeAddr = 0;
+      probeNextAt = now + 400;
+      return;
+    }
+    if ((probeAddr & 63) == 0) Serial.printf("[P] .. 进度 %u/256\n", probeAddr);
+    probeNextAt = now;
+    return;
+  }
+
+  // ---------- B：对非零地址重扫（看值是否在变）----------
+  if (probePhase == 2) {
+    while (probeAddr < 256 && !probeHas[probeAddr]) probeAddr++;
+    if (probeAddr >= 256) {
+      Serial.printf("[P] --- B 完成：%u 个非零地址里 %u 个发生变化（Δ）---\n",
+                    (unsigned)probeValN, (unsigned)probeChgN);
+      if (probeChgN == 0) {
+        Serial.println("[P] ⚠️ 无 Δ ⇒ 可读数据全是静态的（非进度/指针类）⇒ 手段④关闭");
+        probePhase = 0;
+        return;
+      }
+      Serial.print("[P] Δ 地址: ");
+      for (uint8_t i = 0; i < probeChgN; i++) Serial.printf("%02X ", probeChg[i]);
+      Serial.println();
+      probePhase = 3;
+      probeSeqAddr = 0;
+      probeSeqCol = 0;
+      probeNextAt = now;
+      return;
+    }
+    memset(buf, 0, sizeof(buf));
+    uint8_t n = probeSniff((uint8_t)probeAddr, 4, buf, sizeof(buf), 8);
+    uint8_t dl = probeExtract(buf, n, (uint8_t)probeAddr, d4);
+    if (dl > 0) {
+      memcpy(probeV2[probeAddr], d4, 4);
+      bool chg = memcmp(probeDat[probeAddr], probeV2[probeAddr], 4) != 0;
+      Serial.printf("[P] B %02X: %02X %02X %02X %02X -> %02X %02X %02X %02X%s\n",
+                    (unsigned)probeAddr,
+                    probeDat[probeAddr][0], probeDat[probeAddr][1],
+                    probeDat[probeAddr][2], probeDat[probeAddr][3],
+                    probeV2[probeAddr][0], probeV2[probeAddr][1],
+                    probeV2[probeAddr][2], probeV2[probeAddr][3],
+                    chg ? "  ← Δ" : "");
+      if (chg && probeChgN < 6) probeChg[probeChgN++] = (uint8_t)probeAddr;
+    } else {
+      Serial.printf("[P] B %02X: （本轮无回包/被串扰吃掉）\n", (unsigned)probeAddr);
+    }
+    probeAddr++;
+    probeNextAt = now + 400;
+    return;
+  }
+
+  // ---------- C：Δ 地址时序（每 180ms × 20 = 3.6s > 环长）----------
+  if (probePhase == 3) {
+    if (probeSeqCol >= PROBE_SEQ_N) {
+      Serial.printf("[P] C %02X 曲线(20 点 × 180ms，每点 4 字节):\n  ", probeChg[probeSeqAddr]);
+      for (uint8_t i = 0; i < PROBE_SEQ_N; i++) {
+        Serial.printf("%02X%02X%02X%02X|", probeSeq[i][0], probeSeq[i][1],
+                      probeSeq[i][2], probeSeq[i][3]);
+      }
+      Serial.println();
+      probeSeqAddr++;
+      probeSeqCol = 0;
+      if (probeSeqAddr >= probeChgN) {
+        Serial.printf("[P] === 手段④ 探针全部完成，总耗时 %lums ===\n",
+                      (unsigned long)(millis() - probeT0));
+        Serial.println("[P] 判读：某地址数据随采样**单调递增** ⇒ 进度/写指针类寄存器（可闭环）；"
+                       "恒定/乱跳 ⇒ 非进度寄存器 ⇒ 手段④关闭");
+        probePhase = 0;
+        return;
+      }
+      probeNextAt = now;
+      return;
+    }
+    uint8_t a = probeChg[probeSeqAddr];
+    memset(buf, 0, sizeof(buf));
+    uint8_t n = probeSniff(a, 4, buf, sizeof(buf), 8);
+    probeExtract(buf, n, a, d4);
+    memcpy(probeSeq[probeSeqCol], d4, 4);
+    probeSeqCol++;
+    probeNextAt = now + 180;
+    return;
+  }
+}
+#endif  // PROBE_ENABLE
 
 // ========== 点阵屏联动（5x5 LED，协控 addr=8，复用 coUart/sendWait）==========
 // 帧格式：[0x90, 0x08, 0x05, 5列数据, ck]，ck=(0x90+0x08+0x05+Σdata)&0xFF
@@ -790,16 +1279,47 @@ static void mtxApplyEmotion(const String& emo) {
 static uint8_t mtxLastGot = 0;  // 末次尝试收到的字节数（诊断用）
 static uint8_t mtxLastSt = 0;   // 末次响应第 3 字节（0xFF=不足 3 字节）
 
-static bool mtxSend(const uint8_t p[25]) {
+// 5x5 位图 → 9 字节线上帧（头3 + 5列 + ck）。抽出来给阻塞版和快速版共用，
+// 避免两份逻辑各自演进出"少一字节/第5列被 ck 覆盖"那类老坑。
+static void mtxBuild(const uint8_t p[25], uint8_t f[9]) {
   uint8_t cols[5] = {0, 0, 0, 0, 0};
   for (uint8_t y = 0; y < 5; y++)
     for (uint8_t x = 0; x < 5; x++)
       if (p[y * 5 + x]) cols[x] |= (1 << (4 - y));  // 行→列位：(1<<(4-y))<<3 = 1<<(7-y)，与手册 set_pixel 一致
-  uint8_t f[9] = { 0x90, MTX_ADDR, 0x05, 0, 0, 0, 0, 0, 0 };  // ★9 字节：头3 + 5列 + ck（曾错成 8 字节，第5列被 ck 覆盖）
+  f[0] = 0x90; f[1] = MTX_ADDR; f[2] = 0x05;
   for (uint8_t i = 0; i < 5; i++) f[3 + i] = cols[i] << 3;
   uint8_t ck = 0;
   for (uint8_t i = 0; i < 8; i++) ck += f[i];
   f[8] = ck;
+}
+
+// ★V2.2.3 非阻塞点阵发送：只写 9 字节就走（460800 下 ≈0.2ms），不清 RX、不等应答、
+// 不做 400ms 渲染等待。播放中调音量必须走这条——旧路径 mtxSend 最多阻塞 5×150+400ms，
+// 还会清掉在途 PCM 应答 ⇒ 每秒十几帧的重发风暴 ⇒ 用户听到的"调音量断流/卡一下"。
+// 应答 [91 08 xx] 是 3 字节定长，泵任务的音频应答解析会跳过它，不会错位。
+static void mtxSendFast(const uint8_t p[25]) {
+  uint8_t f[9];
+  mtxBuild(p, f);
+  coCmdBusy = true;
+  coUart.write(f, 9);
+  coCmdBusy = false;
+}
+
+// 意图 id → 图案（mtxFlush 与"播放中恢复图标"共用）
+static const uint8_t* mtxPatternOf(uint8_t id) {
+  switch (id) {
+    case MTX_I_MIC:   return MTX_P_MIC;
+    case MTX_I_THINK: return MTX_P_THINK;
+    case MTX_I_PLAY:  return MTX_P_SMILE;  // V2.0.2：播放中显示笑脸（用户偏好，替换三角）
+    case MTX_I_MUSIC: return MTX_P_MUSIC;
+    case MTX_I_FACE:  return mtxFace;
+    default:          return MTX_P_CLEAR;
+  }
+}
+
+static bool mtxSend(const uint8_t p[25]) {
+  uint8_t f[9];
+  mtxBuild(p, f);
   for (uint8_t att = 0; att < 5; att++) {   // 5 次重试+30s 熔断防阻塞主循环
     while (coUart.available()) coUart.read();  // 清残渣（调用点均总线空闲，无音频 ACK 可吃）
     coUart.write(f, 9);
@@ -829,16 +1349,10 @@ static bool mtxSend(const uint8_t p[25]) {
 static void mtxFlush() {
   if (mtxWant == mtxCur) return;
   if (recPhase != 0 || dlActive) return;                  // 录音/播放期间总线忙
+  // ★V2.2.9：音量柱状图显示期内不许覆盖（否则空闲按音量键只闪一下就没了）
+  if (volIconAt && (int32_t)(millis() - volIconAt) < VOL_ICON_MS) return;
   if ((int32_t)(millis() - mtxFailUntil) < 0) return;     // 熔断期内
-  const uint8_t* p;
-  switch (mtxWant) {
-    case MTX_I_MIC:   p = MTX_P_MIC;   break;
-    case MTX_I_THINK: p = MTX_P_THINK; break;
-    case MTX_I_PLAY:  p = MTX_P_SMILE; break;  // V2.0.2：播放中显示笑脸（用户偏好，替换三角）
-    case MTX_I_MUSIC: p = MTX_P_MUSIC; break;
-    case MTX_I_FACE:  p = mtxFace;     break;
-    default:          p = MTX_P_CLEAR; break;
-  }
+  const uint8_t* p = mtxPatternOf(mtxWant);
   if (!mtxSend(p)) {
     mtxFailCnt++;
     // 阶梯重试：前 10 轮每 2s 一试（协控可能比 ESP32 晚启动 ~20s，开机 1s 窗口内失败≠死），
@@ -881,6 +1395,20 @@ static void startDlPlay() {
   mtxFlush();
   dlActive = true;
   dlPendCnt = 0;  // 清流水线在途队列（残留会让下一场错位结算）
+  dlRtxLen = 0;   // ★V2.1.8：重发缓冲同步清空（上一场的尾巴不能混进新会话）
+  dlRtxOff = 0;
+  dlMbGate = 0;   // ★实验①：水位跳过计数（每场清零）
+#if DL_EXP2_SEG
+  dlExp2Segs = 0;     // ★实验②：分段触发计数（每场清零）
+  dlExp2StopSum = 0;
+  dlExp2StopMax = 0;
+  dlSegMaxMs = 0;     // ★EXP2b 探针（每场清零）
+  dlWrapCross = 0;
+  dlWrapAlarm = false;
+  dlPadDone = false;  // ★EXP3 静音垫（每场清零）
+  dlPadAtMs = 0;
+  dlExp2Quiet = 0;
+#endif
   dlStartAt = millis();
   dlSentTotal = 0;
   dlSegResets = 0;
@@ -891,6 +1419,27 @@ static void startDlPlay() {
   dlStarved = false;
   dlFeedDone = false;
   dlToStreak = 0;
+#if PLAY_ACK_LOCK
+  dlRestarts = 0;  // ★V2.1.6：每场播放的重开会话次数（上限 3）
+#endif
+  dlShortAcks = 0;  // ★V2.1.7：本场短收次数（多帧在途安全性的判据）
+  dlShort2s = 0;
+  dlSentDbgPrev = 0;
+  dlAckDbg = 0;
+  dlAckNo = 0;
+  dlStMin2s = 255;
+  dlRtxOverflow = 0;
+  // ★V2.2.8 音量：严格对齐 One 的起播序列 —— 0x14 音量 → 0x10/00 停录 → WAV 头 → PCM。
+  // ★V2.2.9：播放中按音量键会在帧间隙补发 0x14（volPushOne），起播这条仍是第一发。
+  //   不等应答：它的 0x91 0x14 会被 pumpPlay 的 ACK 解析按"h1 != 0x15"丢弃重同步，安全。
+  while (coUart.available()) coUart.read();  // 清上一场残留，避免应答错位
+  {
+    uint8_t v[5] = { 0x90, CMD_VOLUME, 0x01, volHwOf(volTarget), 0 };
+    v[4] = (uint8_t)(v[0] + v[1] + v[2] + v[3]);
+    coUart.write(v, 5);
+    volHwStep = volHwOf(volTarget);
+    volPushPend = false;  // 已按最新档位发过，不再重复
+  }
   // 播放启动指令（阻塞一次性 ~几ms）
   uint8_t s[5] = { 0x90, CMD_CTL, 0x01, 0x00, 0 };
   s[4] = (uint8_t)(0x90 + CMD_CTL + 0x01);
@@ -906,7 +1455,10 @@ static void startDlPlay() {
 
 static void endDlPlay(const char* why) {
   dlActive = false;
+  dlWantStart = false;
   dlPendCnt = 0;
+  dlRtxLen = 0;
+  dlRtxOff = 0;
   dlCutPhase = 0;
   dlStarved = false;
   dlTail = dlHead;
@@ -914,11 +1466,35 @@ static void endDlPlay(const char* why) {
   lastConvAt = millis();
   uint32_t ms = millis() - dlStartAt;
   uint32_t bps = ms ? (uint32_t)((uint64_t)dlSentTotal * 1000 / ms) : 0;
-  Serial.printf("[DL] 播放结束(%s): %lu 字节 / %lu ms（%lu B/s，%lu=实时）| 分段 %lu 次 | 回填 %lums#%lu | 溢出丢样 %lu\n",
+  Serial.printf("[DL] 播放结束(%s): %lu 字节 / %lu ms（%lu B/s，%lu=实时）| 分段 %lu 次 | 回填 %lums#%lu | 溢出丢样 %lu | 短收 %lu 在途 %u\n",
                 why,                 (unsigned long)dlSentTotal, (unsigned long)ms, (unsigned long)bps,
                 (unsigned long)dlRate, (unsigned long)dlSegResets,
                 (unsigned long)dlFillTotal, (unsigned long)dlFillCount,
-                (unsigned long)dlOver);
+                (unsigned long)dlOver, (unsigned long)dlShortAcks,
+                (unsigned)DL_INFLIGHT_MAX);
+#if DL_EXP1_WATER
+  // ★实验① 证据行：水位上限是否真的在起约束（dlMbGate>0 = 泵在等协控播掉，批式生效）
+  Serial.printf("[DL] 实验① 浅水位: 起播预滚 %lums / 投喂水位上限 %lums | 水位跳过 %lu 次"
+                " | 批大小 %u B（官方 200B）\n",
+                (unsigned long)DL_JITGATE_MS, (unsigned long)DL_AHEAD_MAX_MS,
+                (unsigned long)dlMbGate, (unsigned)PLAY_CHUNK);
+#endif
+#if DL_EXP2_SEG
+  // ★实验② 证据行：段界是否真按 2.4s 定时切 + 每次分段的代价（停在协控播自己缓冲=非静音）
+  Serial.printf("[DL] 实验② 主动分段: 段长上限 %lums / 饿透余量 %ldms | 触发 %lu 次"
+                " | 停发 平均 %lums / 最长 %lums | ★实测最长段长 %lums / 越过环长 %lu 次"
+                " | 静音垫 %ldms | 缝落静音 %lu 次\n",
+                (unsigned long)DL_EXP2_SEG_MS, (long)DL_EXP2_DRAIN_MS,
+                (unsigned long)dlExp2Segs,
+                (unsigned long)(dlExp2Segs ? dlExp2StopSum / dlExp2Segs : 0),
+                (unsigned long)dlExp2StopMax,
+                (unsigned long)dlSegMaxMs, (unsigned long)dlWrapCross,
+                (long)DL_EXP2_PAD_MS, (unsigned long)dlExp2Quiet);
+#endif
+  // ★V2.3.0：播放结束必须把音量图案收掉 —— 否则 1.2s 显示保护会把清屏挡回去，
+  //   末尾按过键的挂起柱状图还会在结束后再点亮一次（用户看到"播完了图案不灭"）。
+  volShowPend = false;
+  volIconAt = 0;
   // 播放结束灭屏（用户指定）：覆盖任何挂起意图（包括播放中缓存的表情）
   // ★V2.1.0 例外：服务器"响应未完成就断连"（故事被打断）⇒ 打一张失望脸。
   //   播放期点阵被总线仲裁禁发，只有这里（dlActive 刚置 false、总线空出来）能上屏；
@@ -939,12 +1515,17 @@ static void endDlPlay(const char* why) {
 static void stopDlPlayHard() {
   if (!dlActive) return;
   dlActive = false;
+  dlWantStart = false;
   dlBarged = true;
   dlPendCnt = 0;
+  dlRtxLen = 0;
+  dlRtxOff = 0;
   dlCutPhase = 0;
   dlStarved = false;
   dlTail = dlHead;
   dlPreIdx = 44;
+  volShowPend = false;  // ★V2.3.0：打断也要收掉挂起的音量图案
+  volIconAt = 0;
   while (coUart.available()) coUart.read();
   Serial.println("[DL] TTS 已打断");
 }
@@ -952,7 +1533,44 @@ static void stopDlPlayHard() {
 // 非阻塞流控泵：窗口内"发帧→收ACK→未收满重发"循环（在途语义，锁定 1 帧在途）
 // ACK 在途时窗口内短轮询等待：若直接 return，下一圈 loop（wss TLS 开销 ~16ms）才收
 // ACK → 吞吐掉到 12KB/s，TTS 断续。窗口内等待后每圈可完成 2-3 帧往返。
-static const uint32_t PLAY_WINDOW_MS = 20;
+// ★V2.2.0：泵改由独立任务驱动（见 pumpTaskFunc），窗口只用来"发完一帧就走"，
+// 不再靠长窗口在主循环里阻塞等待——主循环被 ws.loop() 的 TLS 读占满（实测
+// ws 986ms/s、loop 4 圈/s），泵根本没有执行机会，ACK 结算被拖到 250ms/次。
+static const uint32_t PLAY_WINDOW_MS = 6;
+// ★V2.1.10：每圈 WS 轮询次数。库一次 loop 只消费一帧，本机主循环 12~15 圈/s，
+// 单次轮询 ⇒ 13 帧/s（18.7KB/s）追不上 24KB/s 实时播放。8 次留足余量（≈100 帧/s）。
+#define WS_POLL_PER_LOOP 2
+
+#if PLAY_ACK_LOCK
+// ★V2.1.6：协控"完全不吃数据"时的会话重启（0x10 启动 + 重推 WAV 头 + 基线重锚）。
+// 与"饿透复位"的区别：这个由 **ACK 断流** 触发（6 次 × RESP_TIMEOUT ≈600ms 零应答），
+// 不靠水位估算，因此不会因为估算漂移在语音中间误切一刀。
+// 上限 3 次：真僵死（只能断电那种）再重开也没用，别无限刷。
+static void restartCoSession(const char* why) {
+  Serial.printf("[DL] ⚠️ 协控 %s → 重开会话 #%u（已确认 %lu B / FIFO %u B）\n",
+                why, (unsigned)(dlRestarts + 1), (unsigned long)dlSentTotal,
+                (unsigned)dlAvail());
+  uint8_t s[5] = { 0x90, CMD_CTL, 0x01, 0x00, 0 };
+  s[4] = (uint8_t)(0x90 + CMD_CTL + 0x01);
+  sendWait(s, 5);
+  dlRestarts++;
+  memcpy(dlPre, wavHdr, 44);
+  dlPreIdx = 0;      // 头走前置通道，保证先于 PCM 上线
+  dlSegSent = 44;
+  dlPendCnt = 0;
+  dlRtxLen = 0;
+  dlRtxOff = 0;
+  dlToStreak = 0;
+  dlCutPhase = 0;
+  dlStarved = false;
+  dlQuietRun = 0;
+  dlSegPeak = 0;
+  dlInQuiet = false;
+  dlStartAt = millis();
+  dlSentTotal = 0;   // 基线重锚：此刻协控缓冲按空处理
+  dlSentDbgPrev = 0; // ★V2.1.9：同步统计基准，否则 2s 行速率下溢成天文数字
+}
+#endif
 
 static void pumpPlay() {
   if (!dlActive) return;
@@ -961,34 +1579,57 @@ static void pumpPlay() {
     // ---- 流水线 ACK 结算（非阻塞：UART 里够 3 字节就结算队首帧）----
     while (dlPendCnt > 0 && coUart.available() >= 3) {
       uint8_t h0 = coUart.read(), h1 = coUart.read(), h2 = coUart.read();
-      if (h0 != 0x91 || h1 != CMD_PLAY) continue;  // 杂散字节：丢弃重同步
+      if (h0 != 0x91) continue;                    // 杂散字节：丢弃重同步
+      if (h1 == CMD_VOLUME) { volAckLast = h2; continue; }  // ★V2.2.3 音量应答，记账后跳过
+      if (h1 != CMD_PLAY) continue;                // 点阵应答 [91 08 xx] 等：跳过（定长 3B 不错位）
       dlToStreak = 0;  // 协控还在应答 ⇒ 看门狗清零
       uint8_t st = h2;
       uint8_t remAsk = (uint8_t)(dlPendLen[0] - dlPendGot[0]);
       if (st > remAsk) st = remAsk;
+      // ★V2.1.7 诊断：前 12 条应答原样打出来（sent/st/延迟），用来判定协控的
+      // 实际吸收速率——若 st 长期 < sent，说明它在限流，吞吐被它钳住，加帧没用。
+      // ★V2.1.8：稳态也要有样本（每 200 条抽 1 条），否则只看得到开头满收的假象。
+      dlAckNo++;
+      if (st < dlStMin2s) dlStMin2s = st;
+      if (dlAckDbg < 12 || (dlAckNo % 200) == 0) {
+        dlAckDbg++;
+        Serial.printf("[ACK] #%lu sent=%u st=%u lat=%ums 在途=%u rtx=%u/%u\n",
+                      (unsigned long)dlAckNo, (unsigned)dlPendLen[0], (unsigned)st,
+                      (unsigned)(millis() - dlPendAt[0]), (unsigned)dlPendCnt,
+                      (unsigned)(dlRtxLen - dlRtxOff), (unsigned)sizeof(dlRtx));
+      }
       dlPendGot[0] += st;
       dlSentTotal += st;
       dlSegSent += st;  // 分段流式：距上次 WAV 头的 ACK 字节数
       if (dlPendGot[0] < dlPendLen[0]) {
-        // 短收：未确认的剩余字节归还 FIFO 头部，下轮重取重发（官方流控重发语义）
-        dlTail -= (uint16_t)(dlPendLen[0] - dlPendGot[0]);
+        // 短收：协控只吃下 st 字节 ⇒ 未确认的尾巴进重发缓冲，优先补发。
+        // ★V2.1.8：不再 `dlTail -=` 回退 FIFO 读指针——在途多帧时那会退到最新帧
+        // 身上（丢前帧尾巴 + 重复最新帧尾巴）。ARQ 副本保证零丢失零重复，
+        // 代价只是尾巴比在途帧晚到 ≤ 在途字节（≤400B≈16ms）。
+        dlShortAcks++;
+        dlShort2s++;
+        rtxPush(dlPendBuf[0] + dlPendGot[0],
+                (uint16_t)(dlPendLen[0] - dlPendGot[0]));
       }
       for (uint8_t i = 1; i < dlPendCnt; i++) {  // 出队（数组前移）
         dlPendLen[i - 1] = dlPendLen[i];
         dlPendGot[i - 1] = dlPendGot[i];
         dlPendAt[i - 1] = dlPendAt[i];
+        memcpy(dlPendBuf[i - 1], dlPendBuf[i], PLAY_CHUNK);
       }
       dlPendCnt--;
     }
-    // 队首超时（协控整帧未回 ACK）→ 视为整帧丢失，剩余归还 FIFO 后出队
+    // 队首超时（协控整帧未回 ACK）→ 视为整帧丢失，未确认部分进重发缓冲后出队
     if (dlPendCnt > 0 && millis() - dlPendAt[0] > RESP_TIMEOUT) {
       if (dlPendGot[0] < dlPendLen[0]) {
-        dlTail -= (uint16_t)(dlPendLen[0] - dlPendGot[0]);
+        rtxPush(dlPendBuf[0] + dlPendGot[0],
+                (uint16_t)(dlPendLen[0] - dlPendGot[0]));
       }
       for (uint8_t i = 1; i < dlPendCnt; i++) {
         dlPendLen[i - 1] = dlPendLen[i];
         dlPendGot[i - 1] = dlPendGot[i];
         dlPendAt[i - 1] = dlPendAt[i];
+        memcpy(dlPendBuf[i - 1], dlPendBuf[i], PLAY_CHUNK);
       }
       dlPendCnt--;
       // ---- v9.17 协控不应答看门狗 ----
@@ -996,6 +1637,15 @@ static void pumpPlay() {
       // 本场 TTS 截断（协控本来也没在播），设备立即回到可响应态，下一句 TTS
       // 会重新走一次 startDlPlay。
       if (dlToStreak < 255) dlToStreak++;
+#if PLAY_ACK_LOCK
+      // ★V2.1.6：600ms 一个字节都不吃 ⇒ 播放任务大概率已终结（欠载后协控自己停了）。
+      // 重开会话续播，而不是把整段故事判死收场（旧行为要等 30 次 ≈3s 才收场，
+      // 长故事里表现为"讲到一半突然没声、而且再也不回来"）。
+      if (dlToStreak >= 6 && dlRestarts < 3) {
+        restartCoSession("连续 6 次 ACK 超时");
+        return;
+      }
+#endif
       if (dlToStreak >= DL_TO_STREAK_MAX) {
         Serial.printf("[GUARD] ⚠️ 协控不应答看门狗触发：连续 %u 次 ACK 超时（≈%ums 零应答）"
                       "——判协控僵死，主动收场本场（已确认 %lu B / FIFO 剩 %u B）\n",
@@ -1006,14 +1656,14 @@ static void pumpPlay() {
         return;
       }
     }
-    // 在途已满：窗口内短等 ACK（UART 中断自动收）；窗口耗尽则让出 CPU
-    if (dlPendCnt >= 1) {
-      if (millis() - t0 < PLAY_WINDOW_MS) {
-        delayMicroseconds(200);
-        continue;
-      }
+    // 在途已满：直接让出（★V2.2.0）。泵跑在独立任务里，1ms 后自动再来 tick，
+    // 忙等只会把 WS 读取和 WiFi 任务饿死（C3 单核）。
+    if (dlPendCnt >= DL_INFLIGHT_MAX) {
       return;
     }
+    // ★V2.2.9：走到这里说明在途帧已全部结算（dlPendCnt==0）⇒ 帧间隙。
+    // 音量命令可以在这个缝里插一条 5 字节，不会切在 PCM 帧中间。
+    volPushOne();
 
     int32_t aheadNow = (int32_t)dlSentTotal
                        - (int32_t)((uint64_t)(millis() - dlStartAt) * dlRate / 1000);
@@ -1057,6 +1707,7 @@ static void pumpPlay() {
               dlStarved = false;
               dlStartAt = millis();
               dlSentTotal = 0;  // 重锚：死亡=缓冲已排空，此刻=零点
+        dlSentDbgPrev = dlSentTotal;
               Serial.printf("[DL] 死亡指纹复活 #%lu（积压增速 %+ld B/s > 8000 = 播放已冻结，0x10+推头直启）\n",
                             (unsigned long)dlSegResets, (long)dlBTrend);
               return;
@@ -1080,7 +1731,8 @@ static void pumpPlay() {
     bool hardHit = dlSegSent >= dlSegHard
                    && ((dlInQuiet && dlQuietRun >= MS2B(40)) || gapAlign
                        || dlSegSent >= dlSegHard + MS2B(2000));
-    if (dlCutPhase == 0 && !dlFeedDone && dlStreamAlive && hardHit) {
+    // ★V2.1.6：ACK-LOCK 模式下关闭 120s 硬顶分段——连续流不该被人为切缝。
+    if (!PLAY_ACK_LOCK && dlCutPhase == 0 && !dlFeedDone && dlStreamAlive && hardHit) {
       dlCutPhase = 1;
       dlCutPhaseAt = millis();
       Serial.printf("[DL] 段界 %lu：硬顶兜底（played %lums）——饿透复位\n",
@@ -1089,16 +1741,87 @@ static void pumpPlay() {
       return;
     }
 
-    // ---- 积压钳制 4600ms：回填目标 1500ms 远低于此，只作极端兜底 ----
+#if DL_EXP2_SEG
+    // ---- ★实验②：主动定量分段（写指针绕到 2.73067s 之前先复位）----
+    // 连续流下原有触发器全部失效（见 EXP2 说明），这里按"距上次推头的写入量"定量切段。
+    // 阈值用 MS2B（= dlRate 归一），所以在 16k/24k 下行下都等于"2.4s 的内容"、恒 < 65536 样本。
+    // ★EXP2b：门里去掉 !dlFeedDone/!ttsDone。点歌（MCP 流式音乐）时服务器常按块发
+    //   `tts stop`（或整段只发一次 start），这两个标志会在**播放中**就变 true ⇒ 旧门
+    //   把主动分段彻底锁死 ⇒ 绕圈照旧。真正的存活判据是 dlStreamAlive（1.5s 内有音频）。
+    // ---- ★EXP3 段末静音垫：把"缝前区域"换成数字静音（复位缝重放的就是静音）----
+    if (DL_EXP2_PAD_MS > 0 && dlCutPhase == 0 && !dlPadDone
+        && dlSegSent >= MS2B(DL_EXP2_AUDIO_MS)) {
+      dlPadDone = true;
+      dlPadAtMs = millis();
+      int32_t room = (int32_t)DL_SIZE - (int32_t)dlAvail() - 8;
+      int32_t want = MS2B(DL_EXP2_PAD_MS);
+      int32_t n2 = (room < want) ? room : want;
+      for (int32_t k = 0; k < n2; k++) fifoPush(0x80);
+      Serial.printf("[DL] 段末静音垫 #%lu：入队 %ldms 静音（段已推 %lums / FIFO 余量 %ld B）\n",
+                    (unsigned long)(dlExp2Segs + 1),
+                    (long)((int64_t)n2 * 1000 / (int32_t)dlRate),
+                    (unsigned long)((uint64_t)dlSegSent * 1000 / dlRate), (long)room);
+    }
+    // ---- 定量切段：①天然静音缝（零代价）优先 ②垫静音已上线 ③段长硬线（无垫时）----
+    bool exp2QuietSeam = (DL_EXP2_QUIET_RUN_MS > 0 && dlSegSent >= MS2B(DL_EXP2_QUIET_MIN_MS)
+                          && dlInQuiet && dlQuietRun >= MS2B(DL_EXP2_QUIET_RUN_MS));
+    bool exp2Ready = (DL_EXP2_PAD_MS == 0)
+                       ? (dlSegSent >= MS2B(DL_EXP2_SEG_MS))
+                       : (dlPadDone && (dlAvail() == 0 || millis() - dlPadAtMs >= 800));
+    if (dlCutPhase == 0 && dlStreamAlive && (exp2QuietSeam || exp2Ready)) {
+      dlCutPhase = 1;
+      dlCutPhaseAt = millis();
+      dlExp2Segs++;
+      if (exp2QuietSeam) dlExp2Quiet++;
+      Serial.printf("[DL] 分段触发 #%lu：本段已推 %lums（%lu B / 环长 2730ms）——%s\n",
+                    (unsigned long)dlExp2Segs,
+                    (unsigned long)((uint64_t)dlSegSent * 1000 / dlRate),
+                    (unsigned long)dlSegSent,
+                    exp2QuietSeam ? "缝落天然静音（零代价）" : "缝前已垫静音");
+      return;
+    }
+    // ---- ★EXP2b 绕圈探针：本段推量越过环长仍未切段 ⇒ 分段没生效（绕圈必已发生）----
+    // 这是"分段到底有没有干活"的唯一硬指标：正常时 dlSegSent 被 2400ms 截断，永不到 2730。
+    {
+      uint32_t segMsNow = (uint32_t)((uint64_t)dlSegSent * 1000 / dlRate);
+      if (segMsNow > dlSegMaxMs) dlSegMaxMs = segMsNow;
+      if (segMsNow < 1000) {
+        dlWrapAlarm = false;   // 新段开始，重新武装
+        dlPadDone = false;     // ★EXP3：静音垫按段自武装（不依赖 startDlPlay）
+      } else if (segMsNow >= 2730 && !dlWrapAlarm) {
+        dlWrapAlarm = true;
+        dlWrapCross++;
+        Serial.printf("[DL] ⚠️ 越过环长仍未分段：本段已推 %lums > 2730ms"
+                      "（门: 流存活=%d 已喂完=%d tts结束=%d | 停发态=%d）——绕圈必已发生\n",
+                      (unsigned long)segMsNow, (int)dlStreamAlive,
+                      (int)dlFeedDone, (int)ttsDone, (int)dlCutPhase);
+      }
+    }
+#endif
+
+    // ---- 积压钳制 = 投喂水位上限（实验① 的核心变量）----
+    // 原 4600ms 只是"极端兜底"，从不生效；实验① 压到 200ms（官方批大小量级）
+    // ⇒ 泵只在协控剩余 <1 批时才补货 = 官方"在途 ≤1 批 + 缓冲浅"的同构形态。
     // 泄压阀：FIFO 将满时解除钳制（防 FIFO 溢出丢样 + burst 路径死循环→WDT）
-    const int32_t aheadLimit = MS2B(4600);
-    if (aheadNow > aheadLimit && dlAvail() < DL_SIZE - PLAY_CHUNK - 1) {
+    // ★实验②：dlCutPhase!=0 时不得拦截——停发/复位状态机在下面，被拦=分段卡死。
+    const int32_t aheadLimit = MS2B(DL_AHEAD_MAX_MS);
+    if (dlCutPhase == 0 && aheadNow > aheadLimit && dlAvail() < DL_SIZE - PLAY_CHUNK - 1) {
+      dlMbGate++;  // 实验①证据：协控还有货 ⇒ 本圈不投喂（批式节拍）
       return;
     }
 
     // ---- 饥饿复位状态机：停发 → 协控播空（饿透）→ 推头 → 复供 ----
+    // 停发期协控播的是它自己缓冲里的货（不是丢弃），故"停发时长"≈进复位时的在途水位；
+    // 真正的静音 = 播空到新头到货那段窗口 ≈ DL_EXP2_DRAIN_MS 余量（实验② 从 100ms 收到 20ms）。
     if (dlCutPhase == 1) {
-      if (aheadNow <= -MS2B(100) || millis() - dlCutPhaseAt > 1500) {
+      if (aheadNow <= -MS2B(DL_EXP2_DRAIN_MS) || millis() - dlCutPhaseAt > 1500) {
+        uint32_t segMs = (uint32_t)((uint64_t)dlSegSent * 1000 / dlRate);
+        uint32_t stopMs = millis() - dlCutPhaseAt;
+        int32_t pushAhead = aheadNow;
+#if DL_EXP2_SEG
+        dlExp2StopSum += stopMs;
+        if (stopMs > dlExp2StopMax) dlExp2StopMax = stopMs;
+#endif
         memcpy(dlPre, wavHdr, 44);
         dlPreIdx = 0;  // 头走前置通道（FIFO 里可能有已回填数据，压队尾=中途头）
         dlSegSent = 44;
@@ -1110,8 +1833,10 @@ static void pumpPlay() {
         dlStarved = false;
         dlStartAt = millis();
         dlSentTotal = 0;  // 重锚 aheadNow 基线：协控此刻播空=零点
-        Serial.printf("[DL] 段界 %lu：饥饿复位完成（停发 %ums，头已入前置通道）\n",
-                      (unsigned long)dlSegResets, (unsigned long)(millis() - dlCutPhaseAt));
+        dlSentDbgPrev = dlSentTotal;
+        Serial.printf("[DL] 段界 %lu：饥饿复位完成（段长 %lums / 停发 %ums / 推头时积压 %dms）\n",
+                      (unsigned long)dlSegResets, (unsigned long)segMs,
+                      (unsigned long)stopMs, (int)((int64_t)pushAhead * 1000 / dlRate));
       } else {
         return;  // 停发期：积压被协控"播掉"而非清掉，零丢失
       }
@@ -1152,10 +1877,14 @@ static void pumpPlay() {
       }
     }
 
-    // ---- 空闲：前置头队列 + FIFO 取 ≤200 字节组帧发送 ----
+    // ---- 发送优先级：ARQ 重发缓冲 > 前置头 > FIFO 新数据 ----
+    // 未确认的语音尾巴必须紧跟着原帧补发（官方 0x91 流控语义的直接推论）；
+    // 若排到新数据后面，协控就会把音节末尾切掉 8~16ms（听感=吞字）。
     uint16_t availAll = (uint16_t)(dlAvail() + (44 - dlPreIdx));
-    uint8_t n = (uint8_t)(availAll > PLAY_CHUNK ? PLAY_CHUNK : availAll);
-    if (n == 0) {
+    bool fromRtx = (dlRtxOff < dlRtxLen);
+    uint16_t pendBytes = fromRtx ? (uint16_t)(dlRtxLen - dlRtxOff) : availAll;
+    uint8_t n = (uint8_t)(pendBytes > PLAY_CHUNK ? PLAY_CHUNK : pendBytes);
+    if (!fromRtx && n == 0) {
       // 流结束判定（协议优先）：tts stop 已到 + FIFO 空 + 协控基本播完（积压<100ms）才收尾。
       // ⚠️ 曾按空闲 1500ms 硬猜：句间合成停顿 1.5-2s 常见 → 误触发双重断口。
       uint32_t now = millis();
@@ -1235,6 +1964,7 @@ static void pumpPlay() {
         dlStarved = false;
         dlStartAt = millis();
         dlSentTotal = 0;  // 重锚基线：协控此刻播空=零点
+        dlSentDbgPrev = dlSentTotal;
         Serial.printf("[DL] 段界 %lu：饿透恢复推头（标记后 %ums，FIFO %uB/%s）\n",
                       (unsigned long)dlSegResets, (unsigned long)(millis() - dlStarveMarkAt),
                       (unsigned)dlAvail(), enough ? "满水" : "超时强推");
@@ -1242,28 +1972,38 @@ static void pumpPlay() {
         return;  // 攒水中（或还差最后 ~100ms 播空），先不发
       }
     }
-    for (uint8_t i = 0; i < n; i++) {
-      // 取数优先级：头（新会话第一字节）→ FIFO 真数据
-      uint8_t b;
-      if (dlPreIdx < 44) b = dlPre[dlPreIdx++];
-      else b = dlFifo[dlTail++ % DL_SIZE];
-      dlPay[i] = b;
-    }
-    {  // 帧停顿判定：特征=帧内 max|v-128|，≤ max(10, 段内峰值/4) 视为停顿帧。
-      // 语音帧必有 >10 的样本（音节峰值），静音帧 ≤8；均值特征对极轻 TTS 无判别力。
-      uint8_t fmax = 0;
-      for (uint8_t i = 0; i < n; i++) {
-        uint8_t v = dlPay[i];
-        uint8_t d = (v > 128) ? (uint8_t)(v - 128) : (uint8_t)(128 - v);
-        if (d > fmax) fmax = d;
+    if (fromRtx) {  // 重发：直接从缓冲取，不再消耗 FIFO、也不重复做静音判定
+      memcpy(dlPay, dlRtx + dlRtxOff, n);
+      dlRtxOff += n;
+      if (dlRtxOff >= dlRtxLen) {
+        dlRtxLen = 0;
+        dlRtxOff = 0;
       }
-      if (fmax > dlSegPeak) dlSegPeak = fmax;
-      if (fmax <= quietThr()) {
-        dlQuietRun += n;
-        dlInQuiet = true;
-      } else {
-        dlQuietRun = 0;
-        dlInQuiet = false;
+    } else {
+      for (uint8_t i = 0; i < n; i++) {
+        // 取数优先级：头（新会话第一字节）→ FIFO 真数据
+        uint8_t b;
+        if (dlPreIdx < 44) b = dlPre[dlPreIdx++];
+        else b = dlFifo[dlTail++ % DL_SIZE];
+        // ★V2.2.7：数字通路 1:1 直通，不做软件增益（会抬底噪）。音量全交给协控 0x14。
+        dlPay[i] = b;
+      }
+      {  // 帧停顿判定：特征=帧内 max|v-128|，≤ max(10, 段内峰值/4) 视为停顿帧。
+        // 语音帧必有 >10 的样本（音节峰值），静音帧 ≤8；均值特征对极轻 TTS 无判别力。
+        uint8_t fmax = 0;
+        for (uint8_t i = 0; i < n; i++) {
+          uint8_t v = dlPay[i];
+          uint8_t d = (v > 128) ? (uint8_t)(v - 128) : (uint8_t)(128 - v);
+          if (d > fmax) fmax = d;
+        }
+        if (fmax > dlSegPeak) dlSegPeak = fmax;
+        if (fmax <= quietThr()) {
+          dlQuietRun += n;
+          dlInQuiet = true;
+        } else {
+          dlQuietRun = 0;
+          dlInQuiet = false;
+        }
       }
     }
     uint8_t frame[4 + PLAY_CHUNK];
@@ -1281,8 +2021,64 @@ static void pumpPlay() {
     dlPendLen[dlPendCnt] = n;
     dlPendGot[dlPendCnt] = 0;
     dlPendAt[dlPendCnt] = millis();
+    memcpy(dlPendBuf[dlPendCnt], dlPay, n);  // ★V2.1.8：留副本，短收时按 st 补发尾巴
     dlPendCnt++;
   }
+}
+
+// ★V2.2.0 播放泵独立任务（解耦关键）
+// 【为什么】实测 ws.loop() 占了主循环 986ms/s（TLS 读阻塞），主循环只有 4 圈/s。
+//   泵寄生在 loop 里 ⇒ ACK 结算每 250ms 才做一次，一帧要等 250ms 才发下一帧，
+//   吞吐被压在 1KB/s 级；而回调里泵又和 WS 读取串在一起，形成恶性循环。
+// 【怎么做】把泵放到独立任务，1ms 一 tick：
+//   · ACK 结算/发帧都在这里做，与 WS 读取互不阻塞（SSL 阻塞时自动让出 CPU）；
+//   · 回调只写 FIFO + 挂 dlWantStart，绝不碰 UART（避免两个上下文抢同一串口）。
+// 【注意】C3 单核，泵不能长窗口忙等，否则把 WS 任务饿死；所以 pumpPlay 在途满
+//   直接 return，1ms 后再 tick（RTT 4ms ⇒ 4~5 tick 发一帧 ≈ 32KB/s > 实时 24KB/s）。
+// ★ 教训（V2.2.3 翻车）：**空闲≠安全**。协控 RX 里的字节不止是"应答"——
+//   录音时它就是麦克风 PCM（coPumpRecord 自己按 [81 11 n] 头解析）、播放时是 PCM 应答、
+//   调点时是点阵应答。任何第三方任务去"顺手读两字节看看"，都会把别人的流撕开：
+//   实测 coScanSideAcks 把录音 PCM 吃掉 ⇒ 上行 opus 0 帧 ⇒ 服务器当你在 silence ⇒
+//   一声不回（"没声音了"），同时把 mtxSend 的应答偷走 ⇒ 帧永远不确认 ⇒ 主循环被
+//   5×150ms 重试卡死 ⇒ "按音量也没反应"。
+//   结论：**协控串口只有一个读主，谁用谁读，绝不旁路偷看。**
+//   音量应答因此不做读取（0x14 是幂等设置，不依赖 ack），只在播放期间由 pumpPlay
+//   的 3 字节应答解析顺带记账（那里天然是音频应答的唯一读主）。
+
+static TaskHandle_t pumpTaskH = nullptr;
+static void pumpTaskFunc(void*) {
+  for (;;) {
+    if (recPhase == 0) {
+      volApplyPending();  // ★录音中绝不插命令（RX 是麦克风 PCM）
+      volService();       // 音量下发（帧间隙）+ 柱状图（去抖/限流）
+    }
+    if (!dlActive && dlWantStart) {
+      dlWantStart = false;
+      startDlPlay();
+    }
+    if (dlActive) {
+      dlPumpBusy = true;
+      pumpPlay();
+      dlPumpBusy = false;
+    }
+    // 音量柱状图到点恢复状态图标：播放中 mtxFlush 会拒发，这里用快速路径补一帧。
+    if (volIconAt && millis() - volIconAt > VOL_ICON_MS) {
+      volIconAt = 0;
+      if (dlActive) {
+        mtxSendFast(mtxPatternOf(mtxWant));
+      } else {
+        // ★V2.3.0：空闲时立刻补回（含清屏），不再只丢给 loop —— 播放刚好在这 1.2s 内
+        //   结束时，旧写法会让柱状图一直挂到下一次状态变化，看着就是"播完了不灭"。
+        mtxCur = 0xFF;
+        mtxFlush();
+      }
+    }
+    vTaskDelay(1);
+  }
+}
+static void pumpTaskBegin() {
+  if (pumpTaskH) return;
+  xTaskCreate(pumpTaskFunc, "dlpump", 4096, nullptr, 5, &pumpTaskH);
 }
 
 // WS 下行 opus 帧：半双工丢包 → 剥帧头(宽松兼容) → 解码 → 帧内定点重采样 → 8bit 进 FIFO
@@ -1296,6 +2092,16 @@ static void handleAudio(uint8_t* payload, size_t len) {
     return;
   }
   if (len < 2) return;
+  {  // ★V2.1.9：入流节奏采样（判"上游慢"还是"我们读得慢"的唯一硬指标）
+    uint32_t rn = millis();
+    if (dlRxGapAt) {
+      uint32_t g = rn - dlRxGapAt;
+      if (g > dlRxGapMax) dlRxGapMax = g;
+      uint8_t b = (g < 20) ? 0 : (g < 40) ? 1 : (g < 80) ? 2 : (g < 160) ? 3 : 4;
+      dlGapHist[b]++;
+    }
+    dlRxGapAt = rn;
+  }
   if (payload[0] != 0x01 || payload[1] != 0x01) {
     // 小智协议帧头 [0x01 版本][0x01 opus 类型]。部分 xiaozhi-esp32-server 旧版
     // 直接发裸 opus（无帧头）——严格校验会把下行全丢且零日志（TTS 无声！）。
@@ -1336,18 +2142,15 @@ static void handleAudio(uint8_t* payload, size_t len) {
     uint32_t idx = (uint32_t)(p >> 32);
     if (idx >= (uint32_t)n) break;
     // burst 背压：官方服务器按句 burst 发送（实测 1.86x 实时），FIFO 将满时
-    // 强制起播+泵腾空间，绝不丢样（曾"满丢最老"→ burst 溢出丢样=断续）。
-    // 不调 ws.loop()（handleAudio 是其回调，重入禁止）；pumpPlay 不碰 ws 安全
-    while (dlAvail() >= DL_SIZE - PLAY_CHUNK - 1) {
-      if (!dlActive) {
-        startDlPlay();
-      }  // 将满即播（不等 jitter 门槛）
-      if (!dlActive) {
+    // 立刻起播并让泵腾空间，绝不丢样（曾"满丢最老"→ burst 溢出丢样=断续）。
+    // ★V2.2.0：这里不能直接调 pumpPlay()／startDlPlay()——本函数跑在 WS 回调里，
+    //   而泵跑在独立任务中，两边同时动协控串口会错帧。只挂标志，泵任务立刻接手。
+    if (dlAvail() >= DL_SIZE - PLAY_CHUNK - 1) {
+      if (!dlActive) dlWantStart = true;
+      if (!dlActive && dlAvail() >= DL_SIZE - 1) {
         dlTail++;
         dlOver++;
-        break;
-      }  // 起播失败保底丢最老防卡死
-      pumpPlay();
+      }  // 起播还没跟上就彻底满了：丢最老一字节防卡死（极小概率）
     }
     int32_t v;
     if (decimating) {
@@ -1374,7 +2177,7 @@ static void handleAudio(uint8_t* payload, size_t len) {
   if (jitterGate > (int32_t)(DL_SIZE - PLAY_CHUNK - 1))
     jitterGate = (int32_t)(DL_SIZE - PLAY_CHUNK - 1);
   if (!dlActive && dlAvail() >= jitterGate && millis() > dlRetryAt) {
-    startDlPlay();
+    dlWantStart = true;  // ★V2.2.0：起播交给泵任务（回调里不碰协控串口）
   }
 }
 
@@ -1645,6 +2448,145 @@ static bool btnStable = LOW;
 static uint32_t btnEdgeAt = 0;
 static bool btnBStable = LOW;   // B 键（GPIO1）：短按打断 TTS/音乐
 
+// ========== ★V2.2.3 音量控制（A 单击 -，B 单击 +；25 档，1 像素=1 档）==========
+// 协控音量寄存器 0x14 直接收 0..100（One 板同款 N32）。命令帧与播放帧同格式：
+//   [0x90][0x14][len=1][vol][checksum]
+// ★ 单一写者原则：播放期间协控串口只允许「泵任务」写（音频帧/音量帧/图标帧全在它手里）。
+//   按键上下文只改 volTarget + 挂 volPending，1ms 内由泵任务落地 ⇒ 连点不排队、不阻塞。
+//   旧版从按键上下文发命令，被迫 dlPumpPause + 清 RX + 等应答（最多 750ms），
+//   清 RX 会把在途 PCM 应答吃掉 ⇒ 重发风暴 ⇒ 调音量时断流+卡顿。
+
+// ★V2.3.1 音量图案（用户指定：实心三角，不是描边）：
+//   1~5 档 = 从左下角顶点起的**实心**直角三角形，逐档扩一层：
+//     1→1 点 / 2→3 点 / 3→6 点 / 4→10 点 / 5→15 点（左下三角填满）
+//   6 档 = 满档：除右上角 6 格外全亮（19 点），一眼看出"到顶了"
+//   实现：d = x + (4-y)（到左下角的曼哈顿距离），d <= lv-1 的全部点亮。
+static void volBarsPattern(uint8_t lv, uint8_t out[25]) {
+  memset(out, 0, sizeof(uint8_t) * 25);
+  if (lv < 1) lv = 1;
+  if (lv > VOL_LEVELS) lv = VOL_LEVELS;
+  if (lv < VOL_LEVELS) {
+    for (uint8_t y = 0; y < 5; y++) {
+      for (uint8_t x = 0; x < 5; x++) {
+        if ((uint8_t)(x + (4 - y)) <= (uint8_t)(lv - 1)) out[y * 5 + x] = 1;
+      }
+    }
+  } else {
+    memset(out, 1, sizeof(uint8_t) * 25);
+    out[2] = 0; out[3] = 0; out[4] = 0;   // 顶行右侧 3 格
+    out[8] = 0; out[9] = 0;               // 第 2 行右侧 2 格
+    out[14] = 0;                          // 第 3 行最右 1 格（右上角共 6 格不亮）
+  }
+}
+
+// 阻塞版：仅开机同步音量用（此刻泵任务还没起、总线干净）。
+static int volWriteHardwareBlocking() {
+  uint8_t f[5] = {0x90, CMD_VOLUME, 0x01, volHwStep, 0};
+  f[4] = (uint8_t)(f[0] + f[1] + f[2] + f[3]);
+  coUart.write(f, 5);
+  uint8_t got = 0, resp[3] = {0, 0, 0};
+  uint32_t t1 = millis();
+  while (got < 3 && millis() - t1 < 80) {
+    while (coUart.available() && got < 3) {
+      uint8_t b = coUart.read();
+      if (got == 0 && b != 0x91) continue;
+      if (got == 1 && b != CMD_VOLUME) {
+        got = (b == 0x91) ? 1 : 0;
+        continue;
+      }
+      resp[got++] = b;
+    }
+  }
+  return (got >= 3) ? resp[2] : -1;
+}
+
+// 按键只做这一件事：改目标档位。真正的串口动作在泵任务里（volApplyPending）。
+static void volStep(int8_t d) {
+  lastVolActAt = millis();  // ★V2.3.2：调音量也算交互，别刚调完就休眠
+  if (recPhase != 0) {  // 录音中协控串口是上行 PCM，绝不能插命令
+    Serial.println("[VOL] 录音中忽略音量键");
+    return;
+  }
+  int nv = (int)volTarget + d;
+  if (nv < (int)VOL_MIN_LV) nv = VOL_MIN_LV;
+  if (nv > (int)VOL_MAX_LV) nv = VOL_MAX_LV;
+  if (nv == volTarget) {
+    // ★V2.3.0：到顶/到底再按也要有反馈 —— 重新刷一遍当前档位图案（满档=19 点全亮图案），
+    //   旧版直接 return 导致"按加键屏幕没反应"，用户以为按键失效。
+    volShowPend = true;
+    volShowAt = millis();
+    Serial.printf("[VOL] 已到%s限 %u/%u（重刷图案）\n", d > 0 ? "上" : "下",
+                  (unsigned)volTarget, (unsigned)VOL_LEVELS);
+    return;
+  }
+  volTarget = (uint8_t)nv;
+  volPending = true;  // 泵任务下一 tick 落地（≈1ms），连点只会覆盖成最新值，不会排队卡顿
+  Serial.printf("[VOL] 目标 %u/%u 档（硬件 %u）%s\n", (unsigned)volTarget,
+                (unsigned)VOL_LEVELS, (unsigned)volHwOf(volTarget),
+                dlActive ? "播放中→立即下发" : "");
+}
+
+// 播放中把新档位推给协控：**只在流水线空窗（无在途 PCM 帧）发 5 字节**。
+// 调用点有两个：pumpPlay 的 ACK 结算之后、泵任务 tick。
+// 有在途帧时直接返回、保留标志，等下一个空窗——绝不切进 PCM 字节流中间。
+static void volPushOne() {
+  if (!volPushPend || !dlActive || recPhase != 0) return;
+  if (dlPendCnt != 0) return;
+  uint8_t hw = volHwOf(volLevel);
+  if (hw == volHwStep) {
+    volPushPend = false;
+    return;
+  }
+  uint8_t v[5] = { 0x90, CMD_VOLUME, 0x01, hw, 0 };
+  v[4] = (uint8_t)(v[0] + v[1] + v[2] + v[3]);
+  coCmdBusy = true;
+  coUart.write(v, 5);
+  coCmdBusy = false;
+  volHwStep = hw;
+  volPushPend = false;
+  Serial.printf("[VOL] 播放中下发 0x14=%u（帧间隙，在途 0）\n", (unsigned)hw);
+}
+
+// 泵任务调用：按键落地（只改软件状态，串口动作交给 volService，保证单一写者）。
+// ★V2.2.9：播放中不再"等下一句"，改成在 PCM 帧间隙插一条 0x14（见 volService）。
+static void volApplyPending() {
+  if (!volPending) return;
+  volPending = false;
+  volLevel = volTarget;
+  volShowPend = true;      // 刷柱状图（去抖 70ms，连点只画最后一帧）
+  volShowAt = millis();
+  volPushPend = true;      // 播放中把 0x14 推到协控；空闲时不用（起播序列会发）
+  volSaveDirty = true;     // NVS 落盘推迟到空闲（loop 里做），播放中写 flash 会卡 10~40ms
+  volSaveAt = millis();
+  Serial.printf("[VOL] 第 %u/%u 档（硬件 %u）%s\n", (unsigned)volLevel,
+                (unsigned)VOL_LEVELS, (unsigned)volHwOf(volLevel),
+                dlActive ? "播放中→帧间隙下发" : "空闲→已记下");
+}
+
+// 泵任务调用：音量相关的全部串口/点阵动作都从这里出去（单一写者）。
+// ★V2.2.9 两件事：
+//   ① 播放中下发 0x14 —— **只在流水线空窗（dlPendCnt==0）插 5 字节**，绝不插进在途
+//      PCM 帧的字节流中间（那会把帧尾当命令、把命令当 PCM）。它的应答 [91 14 xx]
+//      由 pumpPlay 的定长解析按 h1!=CMD_PLAY 丢弃，不会抢 PCM 结算。
+//   ② 刷 5x5 柱状图 —— 去抖 70ms + 最小间隔 140ms，播放中走快速路径。
+//      旧版"连按 5 次连发 5 帧"会把协控渲染任务排满 ⇒ 3s 不应答 PCM ⇒ 看门狗收场。
+static void volService() {
+  uint32_t now = millis();
+  volPushOne();
+  if (!volShowPend) return;
+  if (now - volShowAt < VOL_ICON_DEBOUNCE) return;              // 还在连点：等松手
+  if (now - volShowSentAt < VOL_ICON_MIN_GAP) return;           // 限流：协控渲染队列
+  volShowPend = false;
+  uint8_t bars[25];
+  volBarsPattern(volLevel, bars);
+  if (dlActive) mtxSendFast(bars);   // 播放中：9 字节即走，不等渲染
+  else mtxSend(bars);                // 空闲：阻塞确认（总线干净，失败会重试）
+  volShowSentAt = millis();
+  volIconAt = volShowSentAt;
+  mtxCur = 0xFF;    // 与 mtxWant 不同 ⇒ 显示期结束后 mtxFlush 补回状态图标
+  Serial.printf("[MTX] 音量柱状图 %u/%u 像素\n", (unsigned)volLevel, (unsigned)VOL_LEVELS);
+}
+
 static void pollButton() {
   bool b = digitalRead(BTN_PIN);
   if (b != btnStable) {
@@ -1659,20 +2601,21 @@ static void pollButton() {
     btnEdgeAt = 0;
   }
 
-  // B 键短按 = 打断当前播放（TTS/音乐），不录音——"只想让它闭嘴"时比按 C 省事。
-  // C 键按住时不触发（防误触）；500ms 限频防触点抖动重复 abort。
-  static uint32_t btnBActAt = 0;
+  // ★V2.2.3：B 键单击 = 音量 +（取消原来的"B 短按打断"，打断统一走 C）。
+  // 松开沿触发，30~600ms 算单击；取消 300ms 限频——连点每一下都计数（只改目标档位，
+  // 不碰串口，所以再快也不会排队或卡顿）。
+  static uint32_t btnBDownAt = 0;
   bool bb = digitalRead(BTN_B_PIN);
   if (bb != btnBStable) {
     btnBStable = bb;
-    if (bb == LOW && btnStable == LOW && (dlActive || !ttsDone)
-        && millis() - btnBActAt > 500) {  // 松开瞬间触发，防按下即打断抖动
-      btnBActAt = millis();
-      if (dlActive) stopDlPlayHard();
-      if (!ttsDone) sendAbort();
-      mtxSet(MTX_I_CLEAR);
-      mtxFlush();
-      Serial.println("[TALK] B 键打断播放");
+    if (bb == HIGH) {
+      btnBDownAt = millis();  // 按下沿
+    } else {
+      uint32_t held = btnBDownAt ? (millis() - btnBDownAt) : 0;
+      btnBDownAt = 0;
+      if (held > 30 && held < 600 && btnStable == LOW) {
+        volStep(+1);
+      }
     }
   }
 }
@@ -2196,7 +3139,7 @@ static void cfgSendPage(const String& msg = "") {
          "点「保存并重启」。设备联网后才能连官方服务器获取激活码。</p>";
   }
   String mac = WiFi.macAddress();
-  h += "<h3>AlphaPi Xiaozhi V2.1.0 配置</h3>";
+  h += "<h3>AlphaPi Xiaozhi " XZ_FW_VERSION XZ_FW_TAG " 配置</h3>";
   // 当前模式徽章：本地=绿 / 官方=红 / 未配置=红，一眼可辨（重启切换架构下刷新即见真相）
   // ★V2.0.6：切换按钮必须知道"现在是什么模式"，才能判断点了算不算"真切换"
   bool isOfficialMode = useSSL;
@@ -2464,11 +3407,16 @@ static void pollBtnA() {
   if (pressed && !btnAHeld) {
     btnAHeld = true;
     btnAAt = millis();
+    btnALong = false;
   } else if (!pressed && btnAHeld) {
     btnAHeld = false;
+    // ★V2.2.3：A 单击（<800ms）= 音量 -。长按已处理过的这次松开不再算单击。
+    uint32_t held = millis() - btnAAt;
+    if (!btnALong && held > 30 && held < 800) volStep(-1);
   }
   if (btnAHeld && millis() - btnAAt >= 2000) {
     btnAHeld = false;
+    btnALong = true;
     if (recPhase || dlActive) {
       Serial.println("[CFG] A 长按忽略（会话进行中）");
       return;
@@ -2486,12 +3434,52 @@ static void pollBtnA() {
   }
 }
 
+// ================== ★V2.3.2 深度休眠（参照 PageTurner V1.0.5）==================
+// 进睡条件：无播放、无录音、非配网门户，且"最近一次交互"已超过 SLEEP_IDLE_MS。
+// 睡前必须收干净：断 WS → 关 WiFi/射频 → 灭屏 → 配 GPIO 电平唤醒 → esp_deep_sleep_start()。
+// 深睡唤醒在 C3 上是**整机复位重启**，所以"唤醒后直接说话"只能靠 setup 里重新检测按键。
+static void enterDeepSleep() {
+  Serial.printf("[SLEEP] 空闲 %lus，进入深度休眠（长按 C 唤醒并直接说话）\n",
+                (unsigned long)(SLEEP_IDLE_MS / 1000));
+  if (dlActive) stopDlPlayHard();            // 理论上不会（条件已排除），兜底
+  // 休眠动画（与翻页器一致）：闪 2 次 X（MTX_P_WIFI_OFF = 大叉），每次 220ms。
+  // 用快速路径（9 字节即走）保证节奏，不等协控渲染 400ms。
+  for (uint8_t i = 0; i < 2; i++) {
+    mtxSendFast(MTX_P_WIFI_OFF);
+    delay(220);
+    mtxSendFast(MTX_P_CLEAR);
+    delay(220);
+  }
+  mtxSend(MTX_P_CLEAR);                      // 收尾灭屏（阻塞确认，顺带清 RX 残渣）
+  if (wsReady) { ws.disconnect(); wsReady = false; delay(50); }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);                       // 关射频：深睡电流从 mA 级降到 µA 级
+  coUart.flush();
+  Serial.flush();
+  // C3 深睡只有 RTC GPIO(0~5) 能唤醒；C=GPIO3，板上外部下拉，按下=高电平
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_PIN, ESP_GPIO_WAKEUP_GPIO_HIGH);
+  delay(50);
+  esp_deep_sleep_start();                    // 不返回；醒来 = setup() 重跑
+  Serial.println("[SLEEP] ⚠️ 深睡启动失败（未返回），继续运行");
+}
+
+static void sleepTick() {
+  if (SLEEP_IDLE_MS == 0) return;
+  if (dlActive || recPhase != 0 || cfgMode) return;   // 播放/录音/配网：绝不睡
+  uint32_t ref = (lastConvAt > lastVolActAt) ? lastConvAt : lastVolActAt;
+  if (millis() - ref < SLEEP_IDLE_MS) return;
+  enterDeepSleep();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n=== AlphaPi_Xiaozhi V2.1.0 (ESP32-C3) ===");
+  Serial.println("\n=== AlphaPi_Xiaozhi " XZ_FW_VERSION XZ_FW_TAG " (ESP32-C3) ===");
+  // ★V2.3.2：本次是不是 C 键从深睡唤醒（深睡唤醒=复位重启，只能靠这个标志接力）
+  wakeByCKey = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO);
+  if (wakeByCKey) Serial.println("[SLEEP] C 键唤醒（深睡重启）：初始化完若仍按住就直接说话");
   Serial.printf("Device-Id: %s\n", deviceId().c_str());
-  Serial.println("按住 C 键(GPIO3)说话，松开等 TTS 回话 | B 短按=打断 | A 长按2s=配网门户开关");
+  Serial.println("按住 C=说话/播放中按下即打断 | A 单击=音量- | B 单击=音量+（25 档，1 像素1档）| A 长按2s=配网门户");
   // ★V2.1.3：顺带把 loopTask 栈大小打出来 —— 48000→32768 是否生效一眼可见
   Serial.printf("[MEM] 启动堆 %u KB（WiFi/协控 UART 前）| loopTask 栈 %u B\n",
                 ESP.getFreeHeap() / 1024, (unsigned)getArduinoLoopTaskStackSize());
@@ -2507,6 +3495,25 @@ void setup() {
   while (coUart.available()) coUart.read();
   delay(100);  // ★等 UART 引脚/协控稳定再发首帧（PageTurner begin() 同款时序）——
                //   过早发帧会被吃成半帧导致协控解析错乱，显示/录音全部不应答
+  // ★V2.2.2：恢复上次音量并同步给协控（协控自己上电是默认值，不设会与显示不一致）
+  // ★V2.2.3：存档改为档位；旧版存的是 0..100 或 25 档，统一折回 1..6 硬件档。
+  {
+    prefs.begin("cfg", true);
+    uint16_t v = prefs.getUChar("vol", 0);
+    prefs.end();
+    // 旧存档折算：0..100（更早版本）或 1..25（V2.2.3~2.2.7）都按比例落到 1..6
+    uint8_t lv;
+    if (v == 0) lv = VOL_DEF_LV;
+    else if (v > VOL_LEVELS) lv = (uint8_t)((v <= 25) ? ((v * 6 + 12) / 25) : ((v * 6 + 50) / 100));
+    else lv = (uint8_t)v;
+    if (lv < VOL_MIN_LV) lv = VOL_MIN_LV;
+    if (lv > VOL_MAX_LV) lv = VOL_MAX_LV;
+    volLevel = volTarget = lv;
+    volHwStep = volHwOf(lv);
+    int ack = volWriteHardwareBlocking();  // 开机同步一次（此后只在每次起播发）
+    Serial.printf("[VOL] 开机第 %u/%u 档（硬件 %u）ack=%d\n",
+                  (unsigned)lv, (unsigned)VOL_LEVELS, (unsigned)volHwStep, ack);
+  }
   // ★不发明屏前置命令、不发 0x00 同步字节（EXP34：0x00 后例行帧 0 字节，疑似毒化解析器；
   //   干净状态 + 带len帧 = @0ms 回 [91,08,05]）
   while (coUart.available()) coUart.read();
@@ -2632,8 +3639,21 @@ void setup() {
   //   现在 ping 由我们发（服务器 pong 照样收得到、照样计数），**断连决定权只留给真证据**
   //   （tcp 掉线 / 死链检测）。半开僵死连接由 wsLastRxAt 在 ensureConnected() 里兜底。
   ws.disableHeartbeat();
+  pumpTaskBegin();  // ★V2.2.0：播放泵独立任务（与 WS 读取解耦，1ms 一 tick）
   Serial.println("[WS] 待机（按需连接：按住说话时才连，官方 S2 同款架构）");
   Serial.println("命令: o=切官方(快照优先) l=切本地 a=联网核对激活 i=信息 h=hello 1/0=listen w=配置网页 s=停止 r=重连 F=恢复出厂 v=详细诊断  A长按2s=配网门户开关");
+
+  // ★V2.3.2：C 键深睡唤醒 → 初始化完若仍按住，直接进入对话（与待机按住 C 完全一致）
+  if (wakeByCKey) {
+    wakeByCKey = false;
+    if (digitalRead(BTN_PIN) == HIGH) {
+      Serial.println("[SLEEP] 唤醒时 C 仍按住 → 直接开始对话");
+      btnStable = HIGH;   // 视作"已按下"：松手时才走 stopTalk，避免再触发一次 startTalk
+      startTalk();
+    } else {
+      Serial.println("[SLEEP] 唤醒时 C 已松开 → 正常待机");
+    }
+  }
 }
 
 void loop() {
@@ -2647,11 +3667,32 @@ void loop() {
       loopRateAt = nowMs;
     }
   }
-  ws.loop();
+  // ★V2.1.10：入流瓶颈修复。WebSocketsClient::loop() 每次**只处理一帧**
+  //（WebSocketsClient.cpp: handleClientData → handleWebsocket 单条），而本主循环
+  //  实测只有 12~15 圈/s ⇒ 下行音频被硬钳在 13 帧/s ≈ 18.7KB/s < 实时 24KB/s
+  //  ⇒ 协控永远欠供 ⇒ 语速被拖慢 + 卡顿（实测 26 帧/2s，正常应 34）。
+  //  一圈多轮询几次即可把上限抬到实时以上；空轮询（available()==0）开销可忽略。
+  uint32_t lp0 = micros();
+  for (uint8_t i = 0; i < WS_POLL_PER_LOOP; i++) {
+    ws.loop();
+    if (!wsReady) break;
+  }
+  uint32_t lp1 = micros();
+  accWsUs += (uint32_t)(lp1 - lp0);
   hbTick();    // ★V2.1.3 自建心跳（关掉库心跳后唯一的 ping 来源，失败只记账）
   pollButton();
   pollBtnA();  // A 键长按 2s 切换 AP 配网门户开/关（STA 不受影响，图标提醒）
   mtxFlush();  // 点阵意图补发（内部判总线空闲+熔断，忙时零开销返回）
+  // ★V2.2.3：音量落盘推迟到空闲（NVS 提交会卡 10~40ms，播放中写 flash 就是一次断流）。
+  // 图标 1.5s 后的恢复动作已交给泵任务（播放中也走非阻塞快速路径）。
+  if (volSaveDirty && !dlActive && recPhase == 0 && millis() - volSaveAt > 800) {
+    volSaveDirty = false;
+    prefs.begin("cfg", false);
+    prefs.putUChar("vol", volLevel);
+    prefs.end();
+    Serial.printf("[VOL] 已保存 %u/%u 档（ack=%u）\n",
+                  (unsigned)volLevel, (unsigned)VOL_LEVELS, (unsigned)volAckLast);
+  }
 
   // Web 配置门户：运行期服务 + 延时重启收尾
   if (cfgMode && cfgWeb) cfgWeb->handleClient();
@@ -2669,6 +3710,9 @@ void loop() {
     ws.disconnect();
   }
 
+  // ★V2.3.2：60s 无动作 → 深睡（播放/录音/配网期间不进；长按 C 唤醒后可直接说话）
+  sleepTick();
+
   if (recPhase == 1) {
     coPumpRecord();  // 协控录音泵（零打印）
     drainUplink();
@@ -2679,20 +3723,63 @@ void loop() {
     }
   }
 
-  if (dlActive) pumpPlay();  // 非阻塞流控播放泵
+  // ★V2.2.0：播放泵已移到 dlpump 任务，主循环不再调用（否则两边抢协控串口）
+  accPumpUs += 0;
+#if PROBE_ENABLE
+  probeTick();  // ★手段④：0x80 寄存器指针扫描（probePhase==0 时一次判空返回，零开销）
+#endif
 
   // 2s 统计（录音期间跳过——零打印铁律）
   static uint32_t lastStat = 0;
-  if (millis() - lastStat >= 2000 && recPhase == 0) {
-    lastStat = millis();
+  uint32_t statNow = millis();
+  if (statNow - lastStat >= 2000 && recPhase == 0) {
+    // ★V2.1.11：真实窗口。阻塞读/慢泵会让一圈跨过 2s，写死除以 2 会把速率虚报，
+    // 之前"喂 23000 B/s"其实是 2.4s 窗口摊出来的，实际只有 18.9k。
+    uint32_t dtms = statNow - lastStat;
+    if (dtms == 0) dtms = 1;
+    lastStat = statNow;
     if (dlFrames || dlDecErr) {
-      Serial.printf("[DL] 2s: %lu 帧 opus (%lu B)%s%s%s | WS入 %lu 帧，最大 %u B%s\n",
-                    (unsigned long)dlFrames, (unsigned long)dlBytes,
-                    dlDropped ? " [半双工丢帧]" : "",
-                    dlOver ? " [FIFO溢出丢样]" : "",
-                    dlDecErr ? " [解码错!]" : "",
-                    (unsigned long)wsRxN, (unsigned)wsRxMax,
-                    wsRxBig ? " ⚠️含>1KB大帧" : "");
+      // ★V2.1.6：2s 行补两项关键判据（ACK-LOCK 是否真的生效）：
+      //   积压 = 按 ACK 记账推出的"协控在途积压"（目标 ≤ DL_AHEAD_MAX_MS）；
+      //   重开 = 本场因 ACK 断流重开会话的次数（正常必须为 0）。
+      {
+        int32_t aheadDbg = dlActive
+                             ? (int32_t)dlSentTotal
+                                 - (int32_t)((uint64_t)(millis() - dlStartAt) * dlRate / 1000)
+                             : 0;
+        Serial.printf("[DL] %lums: %lu 帧 opus (%lu B)%s%s%s | WS入 %lu 帧，最大 %u B%s"
+                      " | 积压 %ldms 喂 %lu B/s 短收 %lu stmin %u 待重发 %u 溢出 %lu 重开 %u"
+                      " | rxgap %ums loop %lu/s fps %lu.%lu gap[%u/%u/%u/%u/%u]"
+                      " ws %lums/s pump %lums/s\n",
+                      (unsigned long)dtms,
+                      (unsigned long)dlFrames, (unsigned long)dlBytes,
+                      dlDropped ? " [半双工丢帧]" : "",
+                      dlOver ? " [FIFO溢出丢样]" : "",
+                      dlDecErr ? " [解码错!]" : "",
+                      (unsigned long)wsRxN, (unsigned)wsRxMax,
+                      wsRxBig ? " ⚠️含>1KB大帧" : "",
+                      (long)((int64_t)aheadDbg * 1000 / (int32_t)dlRate),
+                      (unsigned long)((uint64_t)(dlSentTotal - dlSentDbgPrev) * 1000 / dtms),
+                      (unsigned long)dlShort2s,
+                      (unsigned)dlStMin2s,
+                      (unsigned)(dlRtxLen - dlRtxOff),
+                      (unsigned long)dlRtxOverflow,
+                      (unsigned)dlRestarts,
+                      (unsigned)dlRxGapMax, (unsigned long)loopRate,
+                      (unsigned long)((uint64_t)dlFrames * 100 / dtms),
+                      (unsigned long)((uint64_t)dlFrames * 1000 / dtms % 10),
+                      (unsigned)dlGapHist[0], (unsigned)dlGapHist[1], (unsigned)dlGapHist[2],
+                      (unsigned)dlGapHist[3], (unsigned)dlGapHist[4],
+                      (unsigned long)((uint64_t)accWsUs * 1000 / dtms / 1000),
+                      (unsigned long)((uint64_t)accPumpUs * 1000 / dtms / 1000));
+                      accWsUs = 0;
+                      accPumpUs = 0;
+        dlSentDbgPrev = dlSentTotal;
+        dlShort2s = 0;
+        dlStMin2s = 255;
+        dlRxGapMax = 0;
+        memset(dlGapHist, 0, sizeof(dlGapHist));
+      }
       // ★V2.1.4 链路健康三件套：主循环是否卡住 / 网卡可用 DMA 堆 / 服务器是否还在回心跳
       // ★V2.1.5 精简：这条周期行默认**关闭**（结案后没必要每 2s 刷），串口按 v 打开。
       //   注意：异常路径（停供/断粮块）里那条同内容的链路行**不受此开关影响**，永远照打。
@@ -2711,6 +3798,24 @@ void loop() {
       dlDropped = 0;
       dlOver = 0;
       dlDecErr = 0;
+#if DL_EXP2_SEG
+      // ★EXP2b 分段探针（每 2s）：本段推量是否被 2400ms 截断 + 是否越过环长
+      if (dlActive) {
+        Serial.printf("[DL]   分段: 本段 %lums / 本场最长 %lums（环长 2730）| 已切 %lu 次"
+                      " | 越过环长 %lu 次 | 停发态 %s\n",
+                      (unsigned long)((uint64_t)dlSegSent * 1000 / dlRate),
+                      (unsigned long)dlSegMaxMs, (unsigned long)dlExp2Segs,
+                      (unsigned long)dlWrapCross, dlCutPhase ? "是" : "否");
+      }
+#else
+      // ★EXP4 基线（EXP1/EXP2 全关=连续播放）：本段累计推量越过 2730ms ⇒ 写指针已过环尾，
+      //   绕圈必已发生。这一行是"手段④ 探针测的就是这件事"的现场对照。
+      if (dlActive) {
+        Serial.printf("[DL]   本段 %lums（环长 2730ms）| 本段已绕圈 %s\n",
+                      (unsigned long)((uint64_t)dlSegSent * 1000 / dlRate),
+                      ((uint64_t)dlSegSent * 1000 / dlRate >= 2730) ? "是" : "否");
+      }
+#endif
     }
   }
 
@@ -2747,6 +3852,18 @@ void loop() {
       Serial.printf("[DBG] 详细诊断 %s —— 每 2s 的「[DL] 链路」行%s；"
                     "异常路径（停供/断粮/断开）的链路信息不受本开关影响，始终打印\n",
                     dlVerbose ? "开" : "关", dlVerbose ? "已开启" : "已关闭");
+#if PROBE_ENABLE
+    } else if (c == 'p' || c == 'P') {  // ★手段④：0x80 寄存器指针扫描探针（放歌中按 p）
+      if (probePhase != 0) {
+        Serial.printf("[P] 探针中止（phase=%u，游标 addr=%u）\n", probePhase, probeAddr);
+        probePhase = 0;
+      } else {
+        probeStart();
+      }
+#else
+    } else if (c == 'p' || c == 'P') {
+      Serial.println("[P] 探针未编译（PROBE_ENABLE=0）");
+#endif
     } else if (c == 'a') {  // 联网核对激活状态（写 actboot + 重启，与网页按钮同义）
       Serial.println("[ACT] 联网核对激活状态：写 actboot 标志，重启后 OTA 实查...");
       if (cfgMode) cfgStop();
