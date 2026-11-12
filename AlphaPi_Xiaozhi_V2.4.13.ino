@@ -5014,6 +5014,33 @@ static void cfgSendPage(const String& msg = "") {
        "<button>" + localBtn + "</button></form>"
        "<p class='v'>当前已是本地模式且这四项都没改时，点按钮<b>只刷新状态、设备不重启</b>；"
        "改过任一项才写入并重启生效。</p></fieldset>";
+  // ★V2.4.13 补回：这个区块在 V2.4.0 重构门户时被误删，但代码提示 / README / 刷机页
+  //   一直写着「配网门户『我的媒体库』填 IP」—— 这就是设置页找不到的原因。
+  //   V2.2.0 原文见 AlphaPi_Xiaozhi/AlphaPi_Xiaozhi.ino；此处按 V2.4.13 的
+  //   mLibOn / mLibHostNow() / mLibSave() / /ap/play 现状重写。
+  {
+    String eff = mLibHostNow();
+    String ml = "<fieldset><legend>我的媒体库（自建曲库）</legend>";
+    ml += "<p class='v'>当前: <b>" + String(mLibOn ? "已启用" : "已关闭") + "</b> · 目标 <b>"
+          + (eff.length() ? escHtml(eff) : String("（未配置）")) + ":" + String(mLibPort) + "</b></p>";
+    if (useSSL && !mLibHost.length()) {
+      ml += "<p style='color:#c33'>当前连的是<b>官方小智服务器</b>，媒体库地址无法自动推断，"
+            "<b>必须在下面填媒体库主机的 IP</b>，否则点歌会被拒。</p>";
+    } else if (!mLibHost.length()) {
+      ml += "<p class='v'>主机留空 = 沿用上方「服务器」里那台本地小智服务器的 IP（端口默认 8100）。</p>";
+    }
+    ml += "<form action='/savemlib'><input type='hidden' name='t' value='" + tok + "'>";
+    ml += "主机:<input name='host' value='" + escHtml(mLibHost)
+          + "' placeholder='NAS / Podroid 的 IP；留空=沿用本地服务器'>";
+    ml += "端口:<input name='port' value='" + String(mLibPort) + "'>";
+    ml += "开关:<select name='on'><option value='1" + String(mLibOn ? "' selected>" : "'>") + "启用</option>";
+    ml += "<option value='0" + String(mLibOn ? "'>" : "' selected>") + "关闭</option></select>";
+    ml += "<button>保存（立即生效，不重启）</button></form>";
+    ml += "<p class='v'>设备从这里取流：<code>/ap/play?kind=song|radio|book&amp;q=</code>，"
+          "服务端现转成 8bit/24000 单声道裸 PCM。启用后说「播放XXX」「听凡人修仙传」"
+          "由本机直接播放；也可说「关闭我的媒体库」交还云端。</p></fieldset>";
+    h += ml;
+  }
   h += "<fieldset><legend>操作</legend>"
        "<form action='/reboot'><input type='hidden' name='t' value='" + tok + "'>"
        "<button>重启设备</button></form>"
@@ -5140,6 +5167,29 @@ static void cfgRecheck() {
   cfgRebootAt = millis() + 2000;
 }
 
+// ★V2.4.13 补回（V2.2.0 原有、V2.4.0 误删）：保存「我的媒体库」地址 / 端口 / 开关。
+// 不重启 —— 只是 HTTP 客户端参数，改完立即生效。host 留空 = 沿用本地小智服务器那台机器。
+static void cfgSaveMLib() {
+  if (!cfgCheckToken()) { cfgStalePage(); return; }
+  String host = cfgWeb->arg("host");
+  host.trim();
+  uint16_t port = (uint16_t)cfgWeb->arg("port").toInt();
+  if (!port) port = 8100;
+  bool on = (cfgWeb->arg("on") == "1");
+  mLibHost = host;
+  mLibPort = port;
+  mLibOn = on;
+  mLibSave();                       // cfg 命名空间：mlhost / mlport / mlon
+  if (!mLibOn && mLibState) mLibStop("网页关闭媒体库");
+  Serial.printf("[CFG] 我的媒体库: %s:%u %s\n",
+                mLibHost.length() ? mLibHost.c_str() : "(沿用本地服务器)",
+                mLibPort, mLibOn ? "启用" : "关闭");
+  String shown = mLibHost.length() ? mLibHost
+                 : (mLibHostNow().length() ? mLibHostNow() : String("(未配置)"));
+  cfgSendPage(String("✅ 我的媒体库已保存（立即生效，设备不重启）：") + shown
+              + ":" + String(mLibPort) + " · " + (mLibOn ? "已启用" : "已关闭"));
+}
+
 static void cfgStart() {
   if (cfgMode) return;
   ws.disconnect();
@@ -5153,6 +5203,7 @@ static void cfgStart() {
   cfgWeb->on("/uselocal", cfgUseLocal);
   cfgWeb->on("/activate", cfgActivate);
   cfgWeb->on("/recheck", cfgRecheck);   // V2.0.6：重启并实查激活状态（与"切换"解耦）
+  cfgWeb->on("/savemlib", cfgSaveMLib); // ★V2.4.13 补回：我的媒体库（地址/开关，即时生效不重启）
   cfgWeb->on("/reboot", []() {
     if (!cfgCheckToken()) { cfgStalePage(); return; }
     cfgWeb->send(200, "text/html", "<meta charset='utf-8'><p>重启中…</p>");
