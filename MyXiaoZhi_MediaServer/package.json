@@ -1,0 +1,15 @@
+{
+  "name": "r1-media-server",
+  "version": "1.6.8",
+  "description": "MyXiaoZhi_MediaServer —— R1 音箱 + AlphaPi（小智）双设备媒体服务器（本地音乐库 + 在线音乐库 + 网络电台，一个容器一个端口；小智侧按需转成 8bit/24k；v1.6.0 起支持 /ap/play 三件套 + 按设备 MAC 的播放记录与有声书续播）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js --port 8100",
+    "test": "node _tests/ap-play-args.js && node _tests/ap-history.js",
+    "selftest": "node -e \"const t=require('./transcode');t.check().then(s=>{console.log(s);return t.selftest(1.5)}).then(r=>console.log(r))\""
+  },
+  "license": "ISC",
+  "dependencies": {
+    "music-metadata": "^12.2.1"
+  }
+}

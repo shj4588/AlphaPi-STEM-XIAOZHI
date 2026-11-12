@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log*
+diag
+demo_source.js
+.git
+.gitignore
+# files/ 是运行期状态（落雪地址 / 曲库池 / 标签缓存 / 三块开关 / 电台清单），
+# 由 compose 挂卷持久化。构建时带进去会在重建后被镜像里的旧内容盖掉。
+files/*
+!files/.gitkeep

@@ -1,0 +1,215 @@
+{
+  "_说明": "电台/直播流放这里，不要放进 sources.json —— 那是个曲库，随机播放时抽到永不结束的直播流会把整张歌单卡死。设备端有专门的电台分支：说「播放XXX」就会走 play_radio 按名字匹配（不用报网址）。",
+  "_字段": {
+    "name": "必填。电台名，小智靠它匹配（说「播放XXX」）",
+    "url": "必填。直播流地址（http/https 的 mp3/aac 流都行）",
+    "proxy": "可选。true = 走 NAS 代理转发。公网 https 的源建议开，否则 Android 5.1 老信任库会握手失败",
+    "disabled": "可选。true = 临时停用（源挂了不想删条目时用），music-server v1.5c 起生效"
+  },
+  "radios": [
+    {
+      "name": "国际新闻",
+      "url": "http://lhttp.qtfm.cn/live/20500172/64k.mp3"
+    },
+    {
+      "name": "上海新闻广播",
+      "url": "http://lhttp.qingting.fm/live/270/64k.mp3"
+    },
+    {
+      "name": "CNR-1 中国之声",
+      "url": "http://lhttp.qtfm.cn/live/15318317/64k.mp3"
+    },
+    {
+      "name": "广州新闻资讯广播",
+      "url": "http://lhttp.qingting.fm/live/4848/64k.mp3"
+    },
+    {
+      "name": "深圳新闻广播",
+      "url": "http://lhttp.qingting.fm/live/1270/64k.mp3"
+    },
+    {
+      "name": "北京新闻广播",
+      "url": "http://lhttp.qtfm.cn/live/339/64k.mp3"
+    },
+    {
+      "name": "广东新闻广播",
+      "url": "http://lhttp.qtfm.cn/live/1254/64k.mp3"
+    },
+    {
+      "name": "CityFM城市音乐台",
+      "url": "http://lhttp.qtfm.cn/live/20500153/64k.mp3"
+    },
+    {
+      "name": "北京音乐广播",
+      "url": "http://lhttp.qtfm.cn/live/332/64k.mp3"
+    },
+    {
+      "name": "上海经典音乐广播",
+      "url": "http://lhttp.qingting.fm/live/267/64k.mp3"
+    },
+    {
+      "name": "上海流行音乐广播 动感101",
+      "url": "http://lhttp-hw.qtfm.cn/live/274/64k.mp3"
+    },
+    {
+      "name": "上海音乐广播",
+      "url": "http://lhttp.qingting.fm/live/273/64k.mp3"
+    },
+    {
+      "name": "江苏经典流行音乐广播",
+      "url": "http://lhttp.qtfm.cn/live/4938/64k.mp3"
+    },
+    {
+      "name": "云梦音乐台",
+      "url": "http://lhttp.qtfm.cn/live/20500187/64k.mp3"
+    },
+    {
+      "name": "星空电台 STAR RADIO",
+      "url": "http://lhttp-hw.qtfm.cn/live/5022379/64k.mp3"
+    },
+    {
+      "name": "动听音乐台",
+      "url": "http://lhttp-hw.qtfm.cn/live/5022107/64k.mp3"
+    },
+    {
+      "name": "怀集音乐之声",
+      "url": "http://lhttp.qingting.fm/live/4804/64k.mp3"
+    },
+    {
+      "name": "深圳音乐广播",
+      "url": "http://lhttp.qtfm.cn/live/1271/64k.mp3"
+    },
+    {
+      "name": "Fm891线上音乐台",
+      "url": "http://lhttp.qtfm.cn/live/20500215/64k.mp3"
+    },
+    {
+      "name": "两广之声音乐台",
+      "url": "http://lhttp.qtfm.cn/live/20500149/64k.mp3"
+    },
+    {
+      "name": "广东音乐之声",
+      "url": "http://lhttp.qtfm.cn/live/1260/64k.mp3"
+    },
+    {
+      "name": "广州金曲音乐广播",
+      "url": "http://lhttp.qingting.fm/live/20192/64k.mp3"
+    },
+    {
+      "name": "500首华语经典",
+      "url": "http://lhttp.qtfm.cn/live/5022308/64k.mp3"
+    },
+    {
+      "name": "清晨音乐台",
+      "url": "http://lhttp.qingting.fm/live/4915/64k.mp3"
+    },
+    {
+      "name": "Chinese Classica",
+      "url": "http://radio.chinesemusicworld.com/chinesemusic.mp3"
+    },
+    {
+      "name": "顺德音乐之声",
+      "url": "http://lhttp.qtfm.cn/live/20500150/64k.mp3"
+    },
+    {
+      "name": "内蒙古交通之声",
+      "url": "http://lhttp-hw.qtfm.cn/live/1884/64k.mp3"
+    },
+    {
+      "name": "CRI劲曲调频 HIT FM",
+      "url": "http://lhttp.qingting.fm/live/15318703/64k.mp3"
+    },
+    {
+      "name": "第一财经",
+      "url": "http://lhttp.qingting.fm/live/276/64k.mp3"
+    },
+    {
+      "name": "广东珠江经济台",
+      "url": "http://lhttp.qtfm.cn/live/1259/64k.mp3"
+    },
+    {
+      "name": "羊城交通电台",
+      "url": "http://lhttp.qtfm.cn/live/1262/64k.mp3"
+    },
+    {
+      "name": "广东股市广播",
+      "url": "http://lhttp.qtfm.cn/live/4847/64k.mp3"
+    },
+    {
+      "name": "吉林市广播电视台经济广播",
+      "url": "http://lhttp.qingting.fm/live/1823/64k.mp3"
+    },    
+    {
+      "name": "北京文艺广播",
+      "url": "http://lhttp.qtfm.cn/live/333/64k.mp3"
+    },
+    {
+      "name": "故事广播-阿基米德故事会",
+      "url": "http://lhttp.qtfm.cn/live/20500182/64k.mp3"
+    },
+    {
+      "name": "安徽小说评书广播",
+      "url": "http://lhttp.qtfm.cn/live/1951/64k.mp3"
+    },
+    {
+      "name": "商丘综合广播",
+      "url": "http://lhttp-hw.qtfm.cn/live/5022443/64k.mp3"
+    },
+    {
+      "name": "济南故事广播",
+      "url": "http://lhttp.qtfm.cn/live/1672/64k.mp3"
+    },
+    {
+      "name": "广汉人民广播电台",
+      "url": "http://lhttp.qingting.fm/live/20212405/64k.mp3"
+    },
+    {
+      "name": "德阳综合广播",
+      "url": "http://lhttp-hw.qtfm.cn/live/4987/64k.mp3"
+    },
+    {
+      "name": "Groove Salad",
+      "url": "http://ice1.somafm.com/groovesalad-128-mp3"
+    },
+    {
+      "name": "Secret Agent",
+      "url": "http://ice1.somafm.com/secretagent-128-mp3"
+    },
+    {
+      "name": "Drone Zone",
+      "url": "http://ice1.somafm.com/dronezone-128-mp3"
+    },
+    {
+      "name": "DEF CON Radio",
+      "url": "http://ice1.somafm.com/defcon-128-mp3"
+    },
+    {
+      "name": "杭州交通FM91.8",
+      "url": "http://lhttp.qingting.fm/live/1133/64k.mp3"
+    },
+	{
+      "name": "AsiaFM亚洲经典台",
+      "url": "http://lhttp.qingting.fm/live/5021912/64k.mp3"
+    },
+    {
+      "name": "AsiaFM 亚洲粤语台",
+      "url": "http://lhttp.qtfm.cn/live/15318569/64k.mp3"
+    },
+    {
+      "name": "AsiaFM 亚洲音乐台",
+      "url": "http://lhttp.qtfm.cn/live/5022405/64k.mp3"
+    },
+    {
+      "name": "AsiaFM 亚洲热歌台",
+      "url": "http://lhttp.qtfm.cn/live/20500208/64k.mp3"
+    },
+    {
+      "name": "AsiaFM 亚洲天空台",
+      "url": "http://lhttp.qtfm.cn/live/20071/64k.mp3"
+    },
+    {
+      "name": "AsiaFM 亚洲HD高清音乐台",
+      "url": "http://lhttp.qingting.fm/live/15318341/64k.mp3"
+    }
+  ]
+}

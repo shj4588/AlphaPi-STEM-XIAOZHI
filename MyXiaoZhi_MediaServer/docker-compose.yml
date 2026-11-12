@@ -1,0 +1,72 @@
+# MyXiaoZhi_MediaServer v1.6.8 —— R1 + AlphaPi（小智）双设备媒体服务器（合并版，单一容器）
+#
+#   对外只有 8100；权威版本号是 server.js 的 MS_VER（/api/health 返回 ver=1.6.8）。
+#   本项目原名 R1XiaoZhi_MediaServer，v1.6.8 起更名；从旧版升级先在旧目录
+#   `docker compose down` 再起，避免两个容器抢 8100（详见 README 第九节）。
+#   Podroid / arm64 VM 版见 docs/docker-compose.podroid.yml（端口映射见教程 §1.1）。
+#
+# 历史沿革（配置不用改，仅留档）：
+#   2026-10-17：mini-lx(8100) + r1-music(8010) 合并成一个容器一个端口。
+#     · R1 的 files/music_index 只写 http://<NAS>:8100/index.json
+#     · /index.json 一次吐出：本地音乐库 + 在线随机池 + 网络电台
+#     · 三块都能在 Web 的「音源」页单独开关（关掉 = R1 拿不到）
+#   v1.4.0（2026-11-11）：按客户端身份分流 —— R1 拿原始 mp3/m4a；
+#     AlphaPi 拿 ffmpeg 现转的 8bit/24kHz 单声道裸 PCM（/ap/index.json）。
+#   v1.6.8（2026-11-12）：按设备 MAC 的播放记录与有声书续播、语音调进度 /
+#     读时长 / 读信号、集尾断点夹值 dur-3 + 集尾自动接下一集（配套固件 V2.4.13）。
+#
+# 用法：docker compose up -d --build
+services:
+  r1-media:
+    build:
+      context: .
+      args:
+        # 1 = 装 ffmpeg（AlphaPi 需要）；只给 R1 用可以改 0，镜像小 ~60MB
+        WITH_FFMPEG: "1"
+    image: r1-media:local
+    container_name: MyXiaoZhi_MediaServer
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    volumes:
+      # ★ 关键：flag 账本和曲库池 / 本地标签缓存必须活过容器重建
+      #   files/my_lx           = 落雪 docker（lxserver）地址（取链的唯一通道）
+      #   files/my_base         = 对外 base（反代时才需要写）
+      #   files/pool.json       = 在线曲库池
+      #   files/local_cache.json= 本地曲库标签缓存（首次扫 1188 首后就靠它秒回）
+      #   files/media_flags.json= 三块曲库的可见性开关
+      #   files/quality.json     = 默认音质（128k / 192k / 320k，缺省 128k）
+      #   files/radios.json     = 网络电台清单（可选）
+      - ./files:/app/files
+      # ★ 本地音乐库：左边改成 NAS 上你自己的音乐目录
+      - /volume1/music:/music
+      # ★ v1.2.0 本地有声书库：**单独目录，只放有声书**（改名/加书后 Web 点「重扫磁盘」）
+      - /volume2/日立8TB氦气盘-2/qbdownload/有声读物:/audiobook
+    environment:
+      - TZ=Asia/Shanghai
+      # 容器内音乐目录（与上面的挂载点一致），以及电台清单的位置
+      - MUSIC_DIR=/music
+      # 容器内有声书目录（想换目录就改这两处：挂载点 + 这个变量）
+      - ABL_DIR=/audiobook
+      - RADIOS_FILE=/app/files/radios.json
+      # 电台要不要走本机代理（/radio/<b64>）：不写 = 0 = 设备**直连源站**（默认，
+      # 2026-10-18 对照实验结论）。排障时想对比代理效果就加一行：- RADIO_PROXY=1
+      #
+      # ---------------- AlphaPi（小智）兼容层（v1.4.0 引入） ----------------
+      # 设备识别：auto（默认，按 UA / ?dev=ap / /ap/ 前缀判断）| on（全部当小智，一律转码）
+      #           | off（一律不转码，等于退回 1.3.x 的纯 R1 行为）
+      - AP_TRANSCODE=auto
+      # 转码输出格式，小智那边唯一能吃的组合就是这三行（协控 1 字节 = 1 样本）。
+      # 想验证「是不是格式问题」时改这里，不用改代码。
+      - AP_RATE=24000
+      - AP_BITS=8
+      - AP_CH=1
+      # 8bit 量化后音量偏小的话可以给点数字增益（单位 dB，如 3 或 6）；默认 0 = 不动
+      # - AP_GAIN_DB=3
+      # 首字节超时 / 传输期空闲超时（毫秒）：源站吊死时多久放弃，默认 20s
+      # - AP_START_TIMEOUT_MS=20000
+      # - AP_IDLE_TIMEOUT_MS=20000
+    # SSH 建的宿主机 files/ 多是 root 属主，Dockerfile 的 USER node 会写不了
+    # （pool.json / my_lx / media_flags 更新全哑）。显式用 root 跑最省心，
+    # 内网小服务没有安全顾虑。不想要这行就 chown -R 1000:1000 ./files 二选一。
+    user: "0:0"

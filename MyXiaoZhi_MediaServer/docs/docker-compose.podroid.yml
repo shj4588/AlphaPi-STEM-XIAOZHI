@@ -1,0 +1,55 @@
+# MyXiaoZhi_MediaServer v1.6.8 —— Podroid / arm64 Linux VM 适配版
+#
+# 与发布包根目录 docker-compose.yml 的差异只有两处：
+#   1) 挂载目录改成 VM 本地的 ./files ./music ./audiobook（原版是 NAS 的 /volume1/*）
+#   2) 两个容器都挂外部网络 r1net（落雪地址因此写服务名 http://lxserver:9527）
+#
+# 用法：把本文件复制成部署目录里的 docker-compose.yml，再执行
+#   docker network create r1net
+#   mkdir -p files music audiobook
+#   docker compose up -d --build
+#
+# 升级旧部署时，先把旧目录的 files/ 整个复制过来（配置 / 电台 / 播放记录都在里面）。
+services:
+  r1-media:
+    build:
+      context: .
+      args:
+        # AlphaPi 转码必需（Alpine aarch64 有 ffmpeg 包）；只给 R1 用可改 0，镜像小 ~60MB
+        WITH_FFMPEG: "1"
+        # ★ 首次构建加速：podroid VM 实测官方 apk 源 4s / npmjs 8s，
+        #   阿里云 apk 2s / npmmirror 2s；清华、中科大在这台 VM 上不通。
+        #   删掉这两行 = 走官方源（Dockerfile 的默认值），功能完全一致。
+        AP_MIRROR: "mirrors.aliyun.com"
+        NPM_REGISTRY: "https://registry.npmmirror.com"
+    image: r1-media:local
+    container_name: MyXiaoZhi_MediaServer
+    restart: unless-stopped
+    ports:
+      - "8100:8100"
+    volumes:
+      # ★ 账本 / 在线池 / 标签缓存 / 电台清单 / 播放记录，必须持久化
+      - ./files:/app/files
+      - ./music:/music
+      - ./audiobook:/audiobook
+    environment:
+      - TZ=Asia/Shanghai
+      - MUSIC_DIR=/music
+      - ABL_DIR=/audiobook
+      - RADIOS_FILE=/app/files/radios.json
+      # 电台不写 RADIO_PROXY = 设备直连源站（实测优于代理）
+      # ---------------- AlphaPi（小智）兼容层 ----------------
+      - AP_TRANSCODE=auto
+      - AP_RATE=24000
+      - AP_BITS=8
+      - AP_CH=1
+      # 可选：- AP_GAIN_DB=3 / - AP_START_TIMEOUT_MS=20000 / - AP_IDLE_TIMEOUT_MS=20000
+      #       - AP_DOWN_TIMEOUT_MS=60000 / - AP_PACE=1
+    # SSH 建的 files/ 是 root 属主，Dockerfile 的 USER node 会写不进配置
+    user: "0:0"
+    networks:
+      - r1net
+
+networks:
+  r1net:
+    external: true
