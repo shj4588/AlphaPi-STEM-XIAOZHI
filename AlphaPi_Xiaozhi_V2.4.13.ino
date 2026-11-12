@@ -1,5 +1,136 @@
 /*
  * AlphaPi_Xiaozhi —— STEM 板（ESP32-C3）极简小智 AI 客户端
+ *
+ * V2.4.13（2026-11-12 凌晨）：**修「跳到集尾不接下一集，反而倒回 28 秒重播本集」**。
+ *   ★实机：第 8 集 dur=771s，用户「跳到第十二分钟」(720s) 播到集尾后，服务端日志反复
+ *     「第 8 集起 1 集，跳 741s」+「设备上报位置 pos=769s」+「墙钟兜底 wall=30s」，
+ *     每条记录都 devsync 但**没有 fin**，永远不跳第 9 集。用户听感「回退了 28 秒」。
+ *   ★★真因：`MS2B(uint32_t ms)` 参数是**毫秒**，而 V2.4.10 的断流判据写成
+ *     `MS2B(15)` / `MS2B(30)`，注释却说「差 15s / 30s」——实际只有 360B / 720B
+ *     （15ms / 30ms 音频）。任何一次正常 EOF 只要尾部少收 15ms 就被误判成
+ *     「流被提前掐断」⇒ 不报 fin、2s 后 `ss≈769` 原地续播；服务端 v1.6.3 的防越界
+ *     夹值 `off = dur-30 = 741` 又把它倒回 30 秒 ⇒ 30s 后 EOF、再判断流、再倒回，
+ *     循环 3 次都不跳集（769−741=28，正是用户说的「回退 28 秒」）。
+ *   修法：① `MS2B(15000)` / `MS2B(30000)`（单位改对）；
+ *     ② `atTail`（已听到集尾 5s 内）一律按「本集播完」处理，绝不原地续播；
+ *     ③ 原地续播的 `ss` 也夹到 `dur-3`；服务端 v1.6.8 同步把 `dur-30` 改成 `dur-3`。
+ * V2.4.12（2026-11-11 深夜）：**语音调进度 + 读时长/位置 + 读信号强度**。
+ *   ① 新 MCP 工具 `seek_play`：sec=绝对「跳到第 N 秒/第 N 分钟」，delta=相对
+ *      「快进/后退 N 秒」（正数快进、负数后退）。实现 = 同集 `&ss=<目标秒>` 原地重开流，
+ *      服务端 v1.6.0 起就支持 `-ss` 输入侧快速定位，无需改服务端；目标夹在
+ *      [0, X-Book-Dur-3]，避免落在文件外导致 ffmpeg 零字节「嘀一声」。
+ *   ② `current_play` 增强：书名/集数之外再答 **总时长 / 已播到 / 还剩**，
+ *      小智能直接回答「这集多长」「现在播到哪了」「还剩多久」。
+ *   ③ 新 MCP 工具 `signal_status`：WiFi.RSSI() + 分档结论 + 卡顿建议，
+ *      小智能判断「信号好不好 / 怎么老卡」。
+ *   ④ STT 兜底（仅 MCP 未握手时）支持中文数字口令：快进五分钟 / 后退三十秒 /
+ *      跳到第十分钟；两路互斥，MCP 就绪时仍只交给云端。
+ * V2.4.11（2026-11-11 深夜）：**修「真播完却被判没播完 → 续播不跳集」+ 卡顿优化 2/3/4**。
+ *   实机：第 6 集 dur=828s(13:48) 真播完，设备却报 pos=602s(10:02)、fin=1，服务端
+ *   apFinSane 按"离集尾还远"把正确的 fin 拦下 ⇒ 下次续播倒回同一集。根因不是掐流，
+ *   是播放泵的「饿透恢复推头/段界」每次把 dlSentTotal 清零，而 mLibPlayedSec() 只读它
+ *   ⇒ 三次重锚砍掉 226s。修法：① mLibAckBase 单调累计（重锚只累加不丢）；
+ *   ② 本地流不进饿透状态机（连续 PCM 不重推 WAV 头）；③ 真播完位置直接取 X-Book-Dur
+ *   集尾；④ DL_SIZE 20KB→32KB 吸收网络抖动；⑤ 本地流停供日志改打 socket/RSSI 口径。
+ * V2.4.10（2026-11-11 夜）：**修「一集被误判成播完」**（13.8 分钟的集子断在 6.8 分钟，
+ *   设备照报 fin=1 ⇒ 记录标成已播完、续播跳走一整集）。
+ *   ★真因：fin=1 的唯一来源是"设备看到流结束"（mLibEnded），但**流被服务端/网络提前
+ *     掐断**是同一个表现 —— 服务端和固件都没法只凭"流结束了"区分这两种。
+ *   ★修法（两层）：① 服务端 v1.6.5 拿 `dur` 对账，pos 离集尾 >5s 的 fin 一律拦下；
+ *     ② 固件拿响应头新增的 `X-Book-Dur`（本集时长）对账：收到的字节离"播完整集"
+ *     还差 15s 以上 = 断流 ⇒ **不报 fin、2s 后原地续播**（最多 3 次，失败才失望脸收场，
+ *     记录停在断点）。真播完（字节对上了）才走老路：fin=1 + 自动接下一集。
+ *   ★`PLAY_ACK_LOCK=1`，420s 会话硬顶本就不生效 —— 断在 410s 与它无关，是随机掐断。
+ *   ★顺带：新增**当前播放信息**（服务端 v1.6.5 响应头 `X-Media-Title`：歌名-歌手 /
+ *     书名·演播·第N集 / 台名）—— MCP 新工具 `current_play` 答「现在放的是什么」，
+ *     配网门户状态区也显示；响应头缓冲 640→1024B（中文 URL 编码后很占字节）。
+ *
+ * V2.4.9（2026-11-11 夜）：**播放位置 30s 心跳**（设备断电不再丢整段进度）。
+ *   以前只在「按 C 暂停 / 说停 / 本集播完」才报 /ap/pos —— 设备意外断电、死机、被拔电
+ *   时一次都发不出去，服务端只能把记录停在起播点：听了 40 分钟等于白听。
+ *   ★现在有声书播放中每 30s 报一次 `beat=1`（只更新 pos，不标结束/暂停），最坏丢 30s。
+ *   ★心跳是播放中发的同步 HTTP，会抢主循环 ⇒ 只在 FIFO 水位 >500ms 时发、
+ *     connect 200ms / 收尾 100ms 短超时（FIFO 总共才 853ms，阈值不能写 1.2s）。
+ *   ★队列里已有真事件上报（暂停/播完）时心跳不许插队。
+ *
+ * V2.4.8（2026-11-11 夜）：**修「说继续播放后十几秒没动静」**（V2.4.7 的死锁）。
+ *   ★V2.4.7 写成「等确认语期间一个字节都不读 socket」，而起播要 FIFO 攒够 700ms 预滚、
+ *     预滚只能从 socket 读 —— 确认语一说完就进了「等数据、但永不读」的闭环。
+ *     而且挂起期间每拍都刷新 mLibBufAt，连 15s 取流超时都不触发，实际是**永不开始**。
+ *   ★现在「挂住不读」与「放行起播」共用同一组判据（libWaited / libSpeaking），只在
+ *     两种情况下挂住：① 本轮 tts 已开口（等 stop，或尾音还在协控里播）；② 本轮还没
+ *     开口且仍在「它可能马上开口」的窗口内（无动静 0.5s / 服务器在生成 6s）。
+ *     窗口一过立刻读 socket 灌预滚，20s 绝对兜底。
+ *   ★无动静窗口从 1.5s 收到 0.5s（用户口径）；mLibSawReply 也收紧成「真的收到 text」，
+ *     情绪/附带字段不再让人白等 6s。
+ *
+ * V2.4.7（2026-11-11 夜）：**确认语说完才起播 + 播放中图标不被笑脸顶掉**。
+ *   ★① 起播判据从"ttsDone"改成"**这一轮** tts 轮次"：工具被调用的那一刻，上一轮的
+ *     `tts stop` 还没被新一轮覆盖，ttsDone 仍是 true ⇒ 局域网取流 0.3s 就攒够预滚，
+ *     本地 PCM 抢在"继续播放啦"第一个字上桌把它顶断。现在记 ttsSeq（每次 tts start +1），
+ *     请求时快照 mLibTtsSeq0：**本轮 tts 已开口 ⇒ 必须等它 stop 且 FIFO 播空**才起播；
+ *     本轮一直没开口 ⇒ 1.5s 后认为云端不说话，直接播（12s 绝对兜底）。
+ *   ★② 等确认语期间**一个字节都不许进 FIFO**：FIFO 是 TTS 与本地流共用的，提前把歌塞进去
+ *     会和"继续播放啦"搅在一起播。socket 不读，TCP 背压让 ffmpeg 自己等着，不丢数据。
+ *   ★③ 确认语 stop 且 FIFO 播空 ⇒ 立刻 endDlPlay（静默版：不打屏、不发日志），
+ *     不等泵那套"1.5s 无新字节"判据，用户听不到空白。
+ *   ★④ 图标：播放中（dlIsLocal）一律显示 kind 图案 —— 情绪脸、音量柱状图恢复都不许
+ *     把音符/书/收音机顶掉（以前恢复时画的是 mtxWant，而 mtxWant 早被情绪改成笑脸了）。
+ *
+ * V2.4.6（2026-11-11 夜）：**播放位置改由设备上报**（修"播放记录位置误判"）。
+ *   ★旧做法是服务端拿 `已写进 socket 的字节 / 24000` 当播放位置 —— 本地文件 ffmpeg 转得
+ *     比实时快十几倍，一次就能把剩下几分钟全塞进 TCP 缓冲，于是"听了 3 分钟"被记成"集尾
+ *     11:17"，续播一下跳走一整集；再叠加续播起点 off，位置越滚越偏。
+ *   ★现在设备在**停播/暂停/本集播完**时上报 `/ap/pos?q=&ep=&sec=<集内绝对位置>&fin=`：
+ *     位置 = 服务端给的起点（X-Resume-Offset）+ 本次实播（已发送 − 超前量），只有设备自己
+ *     知道播到哪。服务端收到后就锁死这条记录（devsync），不再用字节数改写。
+ *   ★上报走**队列 + 延迟发送**：不在 mLibStop 里同步发（说话那一刻不能堵 800ms），
+ *     而是排队，等播放泵把 FIFO 收尾（或暂停静音）后再发，超时/连不上就丢弃。
+ *
+ * V2.4.5（2026-11-11 夜）：**有声书自动续播 + 播完重新计空闲**。
+ *   ★自动续播：一集真播完（服务端 EOF，不是被打断）后，等 FIFO 里剩下的音频播空
+ *     （余量 = 剩余字节/24000 + 400ms），自动请求下一集。判据必须用「服务端正常关流」，
+ *     不能拿 pos≈时长去猜 —— 设备中途断连时两个数永远相等。
+ *   ★全书的最后一集：服务端回 404（"已经没有第 N 集了"）⇒ 安静收场 + 笑脸，
+ *     不报警（自动续播发的请求失败不能给用户一个失望脸）。
+ *   ★休眠：播放期间（mLibState / dlActive）**持续刷新空闲基准**，既不许深睡也不让
+ *     空闲钟走表 —— 以前一集 11 分钟播完的瞬间就深睡（lastConvAt 还停在上次说话时）。
+ *
+ * V2.4.3（2026-11-11 夜）：**修「本地播放几分钟就自己停」**。
+ *   ★真凶：播放泵里有三条"云端收场判据"，本地媒体库的音频**不经过 ws、也不依赖 TTS**
+ *     却照样被它们判死 ——
+ *     ① `ttsDone && 1.5s 无新字节 && 协控积压<100ms` → endDlPlay("tts结束")。
+ *        ttsDone 只是"确认语说完了"的残留状态，本地流播放中恒为 true；
+ *        水位控制下 FIFO 满时本来就 0.5~1.5s 不读 socket ⇒ 随机撞上就收场。
+ *     ② `!wsReady && 积压<50ms` → endDlPlay("连接已断")。
+ *        播放期间本机不发上行音频，官方服务器约 80s 就把 ws 踢掉 ⇒ wsReady=false；
+ *        之后任何一次积压掉到 50ms 以下，正在听的书当场掐断。
+ *     ③ 断连时 dlBroken 置位，收场还打"失望脸"，看起来像服务端崩了。
+ *   ★修法：这三条判据一律加 `!mLibState`（本地取流中不适用）。本地流的结束只有两个
+ *     合法来源：mLibEnded（服务端 EOF → 播空收场）+ mLibTick 的 15s 无字节兜底。
+ *   ★顺带：协控不应答的重开次数对本地流放宽（3 → 30），长书里偶发僵死不再判死整场。
+ *
+ * V2.4.2（2026-11-11 夜）：**设备身份 + 有声书续播**（服务端 v1.6.0 配套）。
+ *   ★媒体库请求带 `X-Dev-Mac`（本机 WiFi MAC）+ `X-Dev-Name` —— 服务端按 MAC 记账，
+ *     两台机器各记各的播放进度；不带这个头就只能按 IP 猜，换 IP 就认成新设备。
+ *   ★解析响应头 `X-Book-Ep`：有声书续播时服务端会自己把集号跳到上次那集，
+ *     **本机必须把 mLibPos 同步成服务端实际起播的集号**，否则接着说「下一集」
+ *     会拿 mLibPos=0 算出第 1 集（跳过整本书）。这是 V2.4.1 隐藏的坑。
+ *   ★响应头缓冲 512 → 640B（v1.6.0 多回两个头，别让长 UA 撑爆）。
+ *
+ * V2.4.1（2026-11-11）：**本地播放三件套齐全** —— 歌单连播 / 网络电台 / 有声书。
+ *   ★背景：V2.4.0 只有"按关键词挑一首歌"，播完就断；说「放个电台」「听某某书」云端
+ *     手里根本没有工具，只能自己去搜，用户听到的是云端 search_music 的版本。
+ *   ★关键设计：**队列不在设备上**。服务端 v1.5.1 的 `/ap/play?kind=song|radio|book`
+ *     用 ffmpeg 把「一张歌单」「一本书的连续几集」concat 成**一条** PCM 流，
+ *     本机看到的永远只是"一条音频"，C3 上没有 N 个 rid 的队列、没有第二次取流。
+ *     唯一要记的是 (kind, q, pos)，说「下一首/下一集」时带新的 pos 重连即可。
+ *   ★三个新工具：play_radio(name) / play_book(keyword, episode?) / next_play()。
+ *   ★电台是**无限流**：EOF 不等于"播完了"，会话保险丝临时放宽到 1 小时
+ *     （否则播到 7 分钟会被本地场次硬顶自己掐断）。
+ *   ★X-Track-Count：服务端在响应头报"本条流实际几首"，"下一首"按实际首数跳，
+ *     不死按 6（最后一批可能只有 2 首，死按 6 会直接跳过整批）。
+ *
  * V2.1.5（2026-10-01）：**诊断精简** ——「讲着讲着没声」结案后，把周期诊断从"每 2s 两行"收到"每 2s 一行"。
  *   ★结案依据（整合版 V2.1.4 烧录实测，官方服务器，同句"讲一个2分钟的故事"）：
  *     全程 `2073644 字节 / 86956 ms（23847 B/s）` **完整讲完** —— 分段 0 次、回填 0ms、溢出丢样 0、
@@ -198,7 +329,7 @@
 
 // ================== 固件版本（唯一出处）==================
 // ★升版本只改这一行：AP 配置页标题 + 串口启动横幅都由它渲染，避免漏改。
-#define XZ_FW_VERSION "V2.3.2"
+#define XZ_FW_VERSION "V2.4.13"
 // 实验版识别标记（正式版留空字符串 ""）：同一处渲染 —— 烧进去后一眼能认版本。
 #define XZ_FW_TAG ""
 
@@ -381,6 +512,14 @@ static void printServer() {
 }
 
 // ---------- 官方 OTA 激活流程（轻量 JSON 提取） ----------
+// 报文类型判定：兼容紧凑与带空格两种序列化（python json.dumps 默认 "type": "x"）
+static bool hasMsgType(const String& s, const char* t) {
+  String pat = String("\"type\":\"") + t + "\"";
+  if (s.indexOf(pat) >= 0) return true;
+  pat = String("\"type\": \"") + t + "\"";
+  return s.indexOf(pat) >= 0;
+}
+
 static String jsonStr(const String& s, const char* key) {
   String pat = String("\"") + key + "\":";
   int i = s.indexOf(pat);
@@ -505,7 +644,10 @@ static void buildWavHeader44() {
 
 // ========== 下行链路：WS opus → FIFO → 非阻塞流控泵 → 协控 ==========
 
-static const uint16_t DL_SIZE = 20480;  // 20KB≈853ms@24000，容纳 880ms 起播预滚（按容量钳制）
+// ★V2.4.11：20KB(853ms) → 32KB(1365ms)。串口实测 RSSI -72→-79 时 socket 连续数秒
+//   不来字节，853ms FIFO 一抽干就"饿透→重推头"；加倍后多吸收约 0.5s 网络抖动。
+//   （实测连续堆 38.9KB，静态多 12KB 仍安全；32768 < 65535，uint16_t 够用）
+static const uint16_t DL_SIZE = 32768;  // 32KB≈1365ms@24000
 // 本地服务器 TTS 逐帧发送不均，FIFO 平滑供给；满时丢最老（延迟保护）
 static uint8_t dlFifo[DL_SIZE];
 // ★V2.2.1 关键修复：指针必须 32 位。
@@ -720,9 +862,23 @@ static uint32_t wsLastPingAt = 0, wsLastPongAt = 0;
 static bool dlBroken = false;
 static uint32_t dlStartAt = 0;      // 会话起点（重锚基线）
 static uint32_t dlSentTotal = 0;    // 会话累计已 ACK 字节数
+// ★★V2.4.11：播放位置的**单调累计基准**。泵的每次"重锚"（饿透推头/段界/死亡指纹/
+//   ACK 超时重开会话）都会把 dlSentTotal 清零，而 mLibPlayedSec() 只读它 ⇒ 一集里
+//   重锚三次就把累计实播砍掉三段（实测第 6 集 828s 报成 602s，差 226s），服务端
+//   apFinSane 因此把正确的 fin=1 拦下、续播倒回同一集。清零前先把旧值存进这里。
+//   只在**新的一场本地流**开始时归零，场次内任何重锚都只累加、绝不倒退。
+static uint32_t mLibAckBase = 0;
 static uint32_t dlRetryAt = 0;      // 启动失败退避：2 秒内不重试
 static bool ttsDone = true;         // 服务器 tts state=stop 已到（流结束的协议判据）
                                     // ★初值 true = 开机视为"无 TTS 进行中"（startTalk 据此决定是否发 abort）
+// ★V2.4.7：TTS 轮次计数（每次 tts start 就 +1）。ttsDone 只是"最后一条 tts 消息是不是 stop"，
+//   工具被调用的那一刻它还是**上一轮**的 true —— 拿它当"确认语说完"的判据，本地流就会抢在
+//   第一个字上桌。有了轮次，才能区分"这一轮的确认语还在说"。
+static uint32_t ttsSeq = 0;
+static bool dlEndQuiet = false;     // ★V2.4.7：这一次 endDlPlay 不收屏、不写媒体库日志
+                                    //   （确认语说完让位给本地流，紧接着就要上播放图案）
+static bool dlIsLocal = false;      // ★V2.4.7：本场播放喂的是**本地媒体库**流（不是云端 TTS）
+                                    //   一集播完 FIFO 还在排空的那段 mLibState 已是 0，也得靠它认
 
 // v9.17 协控不应答看门狗：连续 30 次 ACK 超时（≈3s 零应答）= 协控僵死
 // （健康流实测恒 0 超时）→ 主动 endDlPlay 收场，防"泵空转 + 服务器踢连接"不可恢复态
@@ -733,6 +889,139 @@ static uint8_t dlRestarts = 0;               // ★V2.1.6：本场"协控无应�
 // ---- 头前置队列：44B WAV 头必须先于一切 PCM 上线（中途头=会话杀手）----
 static uint8_t dlPre[44];
 static uint8_t dlPreIdx = 44;  // 44=空；0..43=待发头字节游标
+
+// ========== 我的媒体库（自建曲库点播，V2.2.0）==========
+// 语音「启用/关闭我的媒体库」= 本地开关（NVS 持久化）；开启后「播放XXX」由本机直接向
+// MediaServer 取 **8bit/24000 单声道裸 PCM**（服务端已转码），塞进同一条 dlFifo → 协控播放泵。
+// ★这里只放**状态变量**：handleAudio 要用 mLibState 丢服务器残帧，故必须早于它声明；
+//   函数体统一放在 WS 协议段之后（那里 wsReady/sendAbort/mtx* 都已可见）。
+static bool mLibOn = false;          // 媒体库开关（0=关，点歌全部交给云端）
+static String mLibHost;              // 媒体库主机（空=沿用本地小智服务器 host，端口默认 8100）
+static uint16_t mLibPort = 8100;
+static uint8_t mLibState = 0;        // 0=空闲 1=等响应头 2=收流播放
+static WiFiClient mLibCli;
+// ★V2.4.11：socket 可读字节的**主循环快照**。播放泵跑在独立任务里，不能直接调
+//   WiFiClient::available()（lwIP 非线程安全）；泵只打印这个 volatile 值。
+static volatile int mLibSockAvail = 0;
+// ★V2.4.11：1024 → 2048。服务端一张响应头里有 X-Book-Ep / X-Resume-Offset /
+//   X-Book-Dur / X-Media-Title（中文 60 字 URL 编码后最多 ~540B）等十来个头，逼近 1KB；
+//   顶满就认不出 \r\n\r\n ⇒ 15s 等头超时 ⇒ 整条流放弃，而且 mLibDur/mLibBaseSec 全为 0，
+//   正是"时长和位置口径判断有误"的隐藏来源。宁可多花 1KB 静态 RAM。
+static char mLibHdr[2048];
+static uint16_t mLibHdrLen = 0;
+// ★V2.2.1：中转 1024B（不是 512 —— 一圈要能多读几块补满 FIFO；也不贪大，
+//   静态数组同样吃 DRAM，官方 wss 下每一 KB 都算数）。mLibTick 里一圈连读到空为止。
+static uint8_t mLibBuf[1024];        // 一次读出的 PCM 中转（≤ FIFO 剩余空间）
+static uint32_t mLibBytes = 0;       // 本首已收字节
+static uint32_t mLibStartAt = 0;     // 请求起点（等头超时）
+static uint32_t mLibBufAt = 0;       // 末次收到数据的时刻（15s 无数据判死）
+static bool mLibChunked = false;     // 服务器若仍用 chunked（Node 默认），这里解码
+static uint32_t mLibCkRem = 0;       // 当前块剩余字节
+static uint8_t mLibCkCRLF = 0;       // 块数据后的 CRLF 待吃字节数
+static char mLibCkLine[12];          // 块长行（十六进制文本）
+static uint8_t mLibCkLineLen = 0;
+static bool mLibEnded = false;       // 流已结束（末块 / 对端关闭）
+static String mLibCurTitle;          // 当前点播关键词（串口/排障）
+// ★V2.4.10 当前播放的完整信息（服务端 X-Media-Title：歌名-歌手 / 书名·演播·第N集 / 台名）
+static String mLibNowTitle;
+// ★设备侧 MCP（小智协议 {"type":"mcp","payload":{...}}）：服务器握手过 initialize/tools/list
+//   ⇒ 语音指令由云端 LLM 判断意图并调工具（与 R1 客户端同款机制，最稳）。
+//   这个标志只管一件事：MCP 可用时**关掉 STT 关键字兜底**，避免同一次请求触发两遍。
+static bool mLibMcpReady = false;
+// 工具点到歌后不要立刻抢麦：云端还要把"好的，为你播放…"说完。挂起一小会儿，
+// 等 tts stop（或 4s 兜底）再真正起播 —— 否则用户只听到半句被切断的确认语。
+static String mLibPendingQuery;
+static uint32_t mLibPendingAt = 0;
+static uint8_t mLibPendingKind = 1;   // ★V2.4.1 挂起请求的类型：1=歌单 2=电台 3=有声书
+static uint16_t mLibPendingPos = 0;   // 歌单=idx / 有声书=集号
+// ★V2.2.1：**抢跑取流**。MCP 点歌时立刻发 HTTP 请求开始缓冲（这一步要 1~3 秒：
+//   服务端搜歌 + ffmpeg 起转），但**不起播**；等云端确认语说完（ttsDone）立刻接上。
+//   这样才能做到"说完就唱"，而不是"说完 → 干等 2 秒 → 再唱"（实机听感就是接不上）。
+//   STT 兜底路径不走这个：那条已经 abort 了云端，直接起播。
+static bool mLibWaitTts = false;
+// ★V2.4.7：发起这次请求时的 TTS 轮次快照。起播判据改成"等**本轮** tts 说完"：
+//   ttsSeq != mLibTtsSeq0 ⇒ 云端已经为这句话开口了 ⇒ 必须等它 stop；
+//   ttsSeq == mLibTtsSeq0 ⇒ 一直没开口（LLM 只回工具不吭声）⇒ 1.5s 后照播。
+static uint32_t mLibTtsSeq0 = 0;
+static bool mLibTtsDone0 = true;    // 请求那一刻是否"上一轮已经说完"（false = 正说着，得等它停）
+// ★V2.4.7：这一次请求**会不会有云端确认语**。按键「继续播放」是本机自己发起的，
+//   云端根本不知道，等它开口只会白等 1.5s ⇒ 这种请求只等 250ms 攒预滚就走。
+static bool mLibExpectVoice = true;
+// ★V2.4.7：请求发出后，服务器有没有"在说话的路上"（收到任何文本消息：llm 情绪 / 句子 / tts）。
+//   有 ⇒ 确认语迟早会来，耐心等（6s）；一条都没有 ⇒ 这次就是纯工具调用不吭声，1.5s 后照播。
+//   没有这一条，服务器慢一点（LLM 首句 >1.5s）就会重演"把确认语顶断"。
+static bool mLibSawReply = false;
+// ★本地播放的会话保险丝：TTS 的 120s 硬顶对一首 3~5 分钟的歌太短（每 120s 会
+//   "停发→等播空→重推头"，听感就是一次 1.5s 的断口）。本地流是**按消耗速率喂**的
+//   （永不 burst），不需要那么密的复位 ⇒ 本地场次放宽到 7 分钟；收场/打断时恢复。
+static const uint32_t DL_SEG_HARD_LOCAL_MS = 420000;
+
+// ★V2.4.1 播放队列（歌单 / 电台 / 有声书 —— 服务端 v1.5.1 的 /ap/play）：
+//   服务端把「一张歌单」「一本书的连续几集」都用 ffmpeg concat **拼成一条流**，
+//   本机看到的永远只是"一条 PCM"，不需要在 C3 上维护 N 个 rid 的队列。
+//   唯一要记的是 (kind, q, pos)：说「下一首/下一集」时重连并带上新的 pos 即可。
+static uint8_t mLibKind = 0;      // 0=空闲 1=歌单 2=电台 3=有声书
+static String mLibQ;              // 歌单关键词 / 台名 / 书名
+static uint16_t mLibPos = 0;      // 歌单=已跳过几首；有声书=当前集号
+static uint16_t mLibTracks = 0;   // 本条流实际包含几首（服务端 X-Track-Count）
+static bool mLibLive = false;     // 电台 = 无限流：EOF 不等于"播完了"
+// ★V2.4.2：媒体库用它认设备（服务端按 MAC 记播放进度，两台机器互不干扰）。
+//   直接取 WiFi.macAddress() 去冒号转大写，开机算一次，别在请求里现算。
+static String mLibDevMac;         // "F09E9ECB6FBC"
+static String mLibDevName;        // "AlphaPi-STEM-6FBC"
+// ★V2.4.4：有声书「按 C 暂停」—— 停推流 + 上报位置；再按 C 从断点继续。
+//   暂停态下上下文（kind/q/pos）全部保留，所以「下一集」「停」仍然有效。
+static bool  mLibPaused = false;  // 有声书处于暂停态
+static float mLibBaseSec = 0;     // 本条流起点秒（服务端 X-Resume-Offset），算绝对位置用
+// ★V2.4.10 断流自愈：fin=1 的唯一来源是"设备看到流结束"，但流被服务端/网络**提前掐断**
+//   也是同一个表现 —— 实测 13.8 分钟的集子断在 6.8 分钟，设备照报 fin=1 ⇒ 服务端把
+//   记录标成"已播完"、下次续播跳走一整集。现在拿服务端给的集时长（X-Book-Dur）对账：
+//   收到的字节数离"播完整集"还差 15s 以上 = 断流，不报 fin、原地续播（最多 3 次）。
+static uint16_t mLibDur = 0;      // 本集时长秒（响应头 X-Book-Dur；0=未知，退回旧行为）
+static uint8_t  mLibRetryN = 0;   // 本场断流重试次数（上限 3）
+static bool     mLibRetryGo = false;   // mLibAutoAt 到点时走"原地续播"而不是"下一集"
+static float    mLibRetrySs = 0;  // 重试起点（断流那一刻的集内绝对位置）
+static bool  mLibUserStop = false;// 本次收场是用户主动（按 C / 说停）：不自动续播
+// ★V2.4.5：有声书**自动续播**。一集真播完（服务端 EOF，不是被打断）后，等 FIFO
+//   里剩下的音频播空，再自动请求下一集 —— 用户报「播完一集没有续播」就是缺这一步。
+//   mLibAutoAt = 0 表示没有待办；到点后由 mLibTick 顶部消费（那时 mLibState 已经是 0，
+//   所以这个判断必须放在 `if (!mLibState) return;` **之前**）。
+static uint32_t mLibAutoAt = 0;   // 计划续播的时刻（millis）
+static bool mLibAutoReq = false;  // 当前这条请求是自动续播发的（失败就安静收场，别报警）
+static bool mLibAutoGo = false;   // 载体：mLibPlayStream 开头会 mLibStop（清上面那个），用它带进去
+// ★V2.4.6：播放位置上报队列（服务端 v1.6.3 只认设备报的 /ap/pos）。
+//   为什么排队而不在 mLibStop 里直接发：`startTalk()` 也会 mLibStop，用户按下 C 就要说话，
+//   不能让一次同步 HTTP（最坏 800ms）堵在那里。所以只记下"报什么"，到点在主循环里发：
+//   暂停/说停 → 立刻可发；本集播完 → 等 FIFO 播空（否则尾巴还没出声就报，位置偏小）。
+static String   mLibRptQ;         // 要上报的书名（快照，之后 mLibQ 可能被换掉）
+static uint16_t mLibRptEp = 0;    // 要上报的集号
+static float    mLibRptPos = -1;  // 集内绝对位置（秒）；<0 = 队列空
+static float    mLibRptPlay = 0;  // 本次会话实播秒数（老服务端按 sec+起点 结算，兼容用）
+static uint8_t  mLibRptFin = 0;   // 1 = 本集真播完（服务端据此下次续播跳下一集）
+static uint32_t mLibRptAt = 0;    // 到点才发（millis）
+// ★V2.4.9：播放中**周期心跳**（每 30s 把"听到哪了"报一次）。
+//   为什么需要：以前只在「暂停 / 说停 / 本集播完」才上报 —— 设备意外断电、死机、被拔电
+//   时一次都发不出去，服务端只能把记录停在起播点，听了 40 分钟等于白听。
+//   有了心跳，最坏只丢这 30s（服务端还会用墙钟再兜一道，见 v1.6.4 的 histEnd）。
+//   ★心跳不能抢真事件的位置：队列里已有待发上报时（mLibRptPos>=0）就不排。
+//   ★心跳在**播放中**发，HTTP 阻塞会断音 —— 只在 FIFO 水位充足时发、且用短超时。
+#define LIB_POS_BEAT_MS 30000
+static bool     mLibRptBeat = false;  // 这一条是心跳（服务端只更新 pos，不标结束/暂停）
+static uint32_t mLibPosBeatAt = 0;    // 下一次心跳的时刻；0 = 未启动
+
+// 前置声明（IDE 会自动补原型，但显式写出来更稳 —— 这几个在 startTalk 里先用到）
+static void mLibStop(const char* why);
+static void mLibPlayStream(uint8_t kind, const String& q, uint16_t pos, bool waitTts = false,
+                           float seekSec = -1, bool expectVoice = true);
+static void mLibPlayQuery(const String& q, bool waitTts = false);
+static bool mLibNext(bool waitTts = false);
+static void mLibTick();
+static void mLibLog(const char* tag, const char* msg, long a = -1, long b = -1);
+static void mLibPauseAndReport();
+static void mLibResumePlay();
+static float mLibPlayedSec();
+static void mLibQueuePos(float absPos, uint8_t fin, uint32_t delayMs, bool beat = false);
+static void mLibPosTick();
 
 static inline uint16_t dlAvail() {
   return (uint16_t)(dlHead - dlTail);
@@ -1167,6 +1456,24 @@ static const uint8_t MTX_P_MUSIC[25] = {    // 音符（点歌播放中）
     0,0,1,0,0,
     0,1,1,0,0,
     0,1,1,0,0};
+static const uint8_t MTX_P_BOOK[25] = {     // 摊开的书（有声书播放中，用户 2026-11-11 选定）
+    1,0,0,0,1,
+    1,1,0,1,1,
+    1,1,0,1,1,
+    1,1,0,1,1,
+    0,1,1,1,0};
+static const uint8_t MTX_P_RADIO[25] = {    // 收音机（网络电台播放中，同日选定）
+    1,0,0,0,0,
+    0,1,1,1,1,
+    1,0,1,0,1,
+    1,0,1,0,1,
+    1,1,1,1,1};
+static const uint8_t MTX_P_PAUSE[25] = {    // 暂停（有声书按 C 暂停后）
+    0,0,0,0,0,
+    1,1,0,1,1,
+    1,1,0,1,1,
+    1,1,0,1,1,
+    0,0,0,0,0};
 // ---- 情绪脸（服务器 {"type":"llm","emotion":"..."} 驱动）----
 static const uint8_t MTX_P_SMILE[25] = {
     0,0,0,0,0,
@@ -1245,7 +1552,8 @@ static const uint8_t MTX_P_WIFI_OFF[25] = {  // 配网门户已关（大 X）
 };
 
 // ---- 意图状态机：想显示什么(mtxWant) vs 已上屏什么(mtxCur) ----
-enum { MTX_I_CLEAR = 0, MTX_I_MIC, MTX_I_THINK, MTX_I_PLAY, MTX_I_MUSIC, MTX_I_FACE };
+enum { MTX_I_CLEAR = 0, MTX_I_MIC, MTX_I_THINK, MTX_I_PLAY, MTX_I_MUSIC,
+       MTX_I_BOOK, MTX_I_RADIO, MTX_I_PAUSE, MTX_I_FACE };
 static uint8_t mtxWant = MTX_I_CLEAR;
 static uint8_t mtxCur = 0xFF;               // 0xFF=未知（开机首帧必发）
 static const uint8_t* mtxFace = MTX_P_NEUTRAL;  // 最近一次情绪脸
@@ -1256,8 +1564,21 @@ static uint8_t mtxFailCnt = 0;              // 连续失败轮数（阶梯重试
 static void mtxSet(uint8_t id) { mtxWant = id; }
 static void mtxSetFace(const uint8_t* face) { mtxFace = face; mtxWant = MTX_I_FACE; }
 
+// ★V2.4.7：本地媒体库"图标持有期" —— 本地流播放中（含"一集播完、FIFO 还在排空"那段），
+//   以及有声书暂停态。这段期间**云端的一律让位**：以前服务器的 {"emotion":"happy"} 一来就把
+//   mtxWant 改成笑脸，用户调一下音量（柱状图 1.2s 后恢复图标画的是 mtxWant）屏幕上就永久
+//   变成笑脸，有声书/音乐/电台的图案再也回不来。用户口径：这段只显示 kind 图案 / 暂停图案。
+static inline bool mLibIconHold() {
+  return (dlActive && dlIsLocal) || (mLibPaused && mLibKind == 3);
+}
+static inline uint8_t mLibIconId() {
+  if (mLibPaused && mLibKind == 3) return MTX_I_PAUSE;
+  return mLibKind == 3 ? MTX_I_BOOK : (mLibKind == 2 ? MTX_I_RADIO : MTX_I_MUSIC);
+}
+
 // 服务器情绪名 → 5x5 脸（未收录情绪一律中性脸）
 static void mtxApplyEmotion(const String& emo) {
+  if (mLibIconHold()) return;   // ★V2.4.7：本地流在播/暂停中 —— 图标不换脸
   if (emo == "happy" || emo == "silly" || emo == "delicious" || emo == "kissy") mtxSetFace(MTX_P_SMILE);
   else if (emo == "laughing" || emo == "cool" || emo == "relaxed" || emo == "confident" || emo == "winking") mtxSetFace(MTX_P_GRIN);
   else if (emo == "loving") mtxSetFace(MTX_P_HEART);
@@ -1312,6 +1633,9 @@ static const uint8_t* mtxPatternOf(uint8_t id) {
     case MTX_I_THINK: return MTX_P_THINK;
     case MTX_I_PLAY:  return MTX_P_SMILE;  // V2.0.2：播放中显示笑脸（用户偏好，替换三角）
     case MTX_I_MUSIC: return MTX_P_MUSIC;
+    case MTX_I_BOOK:  return MTX_P_BOOK;
+    case MTX_I_RADIO: return MTX_P_RADIO;
+    case MTX_I_PAUSE: return MTX_P_PAUSE;
     case MTX_I_FACE:  return mtxFace;
     default:          return MTX_P_CLEAR;
   }
@@ -1391,7 +1715,16 @@ static void startDlPlay() {
   dlPreIdx = 0;    // 头进前置队列：保证先于预滚 PCM 上线（中途头=会话杀手）
   dlSegSent = 44;  // 开播头 44B 计入首段
   // 点阵：说话/点歌图标。★必须在 dlActive=true 之前发——mtxFlush 判总线忙会拒发
-  mtxSet(mtxMusic ? MTX_I_MUSIC : MTX_I_PLAY);
+  // ★V2.4.4：本地流按 kind 区分图案（音符 / 书 / 收音机）；云端 TTS 的"点歌"仍是音符
+  // ★V2.4.7：本地场次用 dlIsLocal 认（一集播完 FIFO 还在排空时 mLibState 已是 0，
+  //   但那一场的图标仍然必须是有声书图案，不能退回笑脸/音符）。
+  //   ★必须带 !mLibWaitTts：等确认语那段 mLibState 也是 2，可那时播的是**云端 TTS**，
+  //   不能被当成"本地流"（否则一集没收场就被判成本地图案 / 云端残帧全丢）。
+  dlIsLocal = (mLibState != 0 && !mLibWaitTts);
+  mtxSet(mtxMusic ? (dlIsLocal ? (mLibKind == 3 ? MTX_I_BOOK
+                                 : (mLibKind == 2 ? MTX_I_RADIO : MTX_I_MUSIC))
+                              : MTX_I_MUSIC)
+                  : MTX_I_PLAY);
   mtxFlush();
   dlActive = true;
   dlPendCnt = 0;  // 清流水线在途队列（残留会让下一场错位结算）
@@ -1410,6 +1743,7 @@ static void startDlPlay() {
   dlExp2Quiet = 0;
 #endif
   dlStartAt = millis();
+  mLibAckBase = 0;      // ★V2.4.11：新场次，单调累计基准归零
   dlSentTotal = 0;
   dlSegResets = 0;
   dlQuietRun = 0;
@@ -1455,6 +1789,7 @@ static void startDlPlay() {
 
 static void endDlPlay(const char* why) {
   dlActive = false;
+  dlIsLocal = false;   // ★V2.4.7：这一场结束，之后的场次重新判
   dlWantStart = false;
   dlPendCnt = 0;
   dlRtxLen = 0;
@@ -1472,6 +1807,12 @@ static void endDlPlay(const char* why) {
                 (unsigned long)dlFillTotal, (unsigned long)dlFillCount,
                 (unsigned long)dlOver, (unsigned long)dlShortAcks,
                 (unsigned)DL_INFLIGHT_MAX);
+  // ★V2.4.4：本地流每收一次场就把原因发给媒体库 —— 串口拿不到日志，这是唯一线索。
+  //   mLibState 还非 0 = 收场时取流仍挂着（真正的"意外收场"）；用户按 C 暂停那条
+  //   已经先 mLibStop 把 mLibState 清 0 了，不会重复上报。
+  //   ★V2.4.7 dlEndQuiet：确认语说完让位给本地流，这不是"意外收场"，别污染 devlog
+  //   （mLibLog 是阻塞 HTTP，最坏 600ms，紧跟着就要起播）。
+  if (mLibState && !dlEndQuiet) mLibLog("DEND", why, (long)dlSentTotal, (long)ms);
 #if DL_EXP1_WATER
   // ★实验① 证据行：水位上限是否真的在起约束（dlMbGate>0 = 泵在等协控播掉，批式生效）
   Serial.printf("[DL] 实验① 浅水位: 起播预滚 %lums / 投喂水位上限 %lums | 水位跳过 %lu 次"
@@ -1499,6 +1840,9 @@ static void endDlPlay(const char* why) {
   // ★V2.1.0 例外：服务器"响应未完成就断连"（故事被打断）⇒ 打一张失望脸。
   //   播放期点阵被总线仲裁禁发，只有这里（dlActive 刚置 false、总线空出来）能上屏；
   //   对用户而言这是"为什么没声了"的唯一可见答案，比静悄悄灭屏有用得多。
+  // ★V2.4.7 dlEndQuiet：确认语说完只是"让位"，屏幕要留给下一拍的播放图案 ——
+  //   这里既不清屏也不发帧（一次 mtxSend 要阻塞 ~400ms 渲染，紧跟着起播会被拖慢）。
+  if (dlEndQuiet) return;
   if (dlBroken) {
     dlBroken = false;
     mtxFace = MTX_P_FROWN;
@@ -1515,6 +1859,7 @@ static void endDlPlay(const char* why) {
 static void stopDlPlayHard() {
   if (!dlActive) return;
   dlActive = false;
+  dlIsLocal = false;   // ★V2.4.7
   dlWantStart = false;
   dlBarged = true;
   dlPendCnt = 0;
@@ -1567,6 +1912,7 @@ static void restartCoSession(const char* why) {
   dlSegPeak = 0;
   dlInQuiet = false;
   dlStartAt = millis();
+  mLibAckBase += dlSentTotal;   // ★V2.4.11：重锚不丢已播累计
   dlSentTotal = 0;   // 基线重锚：此刻协控缓冲按空处理
   dlSentDbgPrev = 0; // ★V2.1.9：同步统计基准，否则 2s 行速率下溢成天文数字
 }
@@ -1641,7 +1987,10 @@ static void pumpPlay() {
       // ★V2.1.6：600ms 一个字节都不吃 ⇒ 播放任务大概率已终结（欠载后协控自己停了）。
       // 重开会话续播，而不是把整段故事判死收场（旧行为要等 30 次 ≈3s 才收场，
       // 长故事里表现为"讲到一半突然没声、而且再也不回来"）。
-      if (dlToStreak >= 6 && dlRestarts < 3) {
+      // ★V2.4.3：本地媒体库场次放宽到 30 次重开 —— 一本 20 分钟的书里，协控偶发僵死
+      //   2~3 次很常见，用旧的 3 次上限会在第 4 次直接把整场判死（= "听一半没了"）。
+      //   云端 TTS 仍用 3 次（它每句都重开会话，没必要一直硬撑）。
+      if (dlToStreak >= 6 && dlRestarts < (mLibState ? 30 : 3)) {
         restartCoSession("连续 6 次 ACK 超时");
         return;
       }
@@ -1706,6 +2055,7 @@ static void pumpPlay() {
               dlInQuiet = false;
               dlStarved = false;
               dlStartAt = millis();
+              mLibAckBase += dlSentTotal;   // ★V2.4.11
               dlSentTotal = 0;  // 重锚：死亡=缓冲已排空，此刻=零点
         dlSentDbgPrev = dlSentTotal;
               Serial.printf("[DL] 死亡指纹复活 #%lu（积压增速 %+ld B/s > 8000 = 播放已冻结，0x10+推头直启）\n",
@@ -1832,6 +2182,7 @@ static void pumpPlay() {
         dlCutPhase = 0;
         dlStarved = false;
         dlStartAt = millis();
+        mLibAckBase += dlSentTotal;   // ★V2.4.11
         dlSentTotal = 0;  // 重锚 aheadNow 基线：协控此刻播空=零点
         dlSentDbgPrev = dlSentTotal;
         Serial.printf("[DL] 段界 %lu：饥饿复位完成（段长 %lums / 停发 %ums / 推头时积压 %dms）\n",
@@ -1893,24 +2244,37 @@ static void pumpPlay() {
       // 饿透标记：FIFO 空 + 协控积压 ≤50ms ⇒ 饿透在即/已发生。不立即推头（长停顿
       // 会把新会话也饿死），置标记等数据恢复瞬间再推——重启成本全部落在停顿里=免费。
       // 开播 500ms 内不标记：预滚灌入期 FIFO 瞬时见底属正常（防开机双重推头）。
-      if (!ttsDone && !dlFeedDone && !dlStarved && ahead <= MS2B(50)
+      // ★★V2.4.11：本地媒体库流**不进饿透状态机**。它是连续 PCM 字节流、没有
+      //   "会话边界"可重开；一次网络抖动就重推 44B WAV 头，既把断口切进音频里，
+      //   又清零 dlSentTotal 让实播少算（见 mLibAckBase 注释）。只补水、不重开。
+      if (!mLibState && !ttsDone && !dlFeedDone && !dlStarved && ahead <= MS2B(50)
           && now - dlStartAt > 500) {
         dlStarved = true;
         dlStarveMarkAt = now;
         Serial.printf("[DL] 协控饿透标记（积压 %dms / FIFO 空）——数据恢复时重推头\n",
                       (int)((int64_t)ahead * 1000 / dlRate));
       }
-      // tts stop 后仍有尾包迟到（实测 10 帧/1.8s），等 1500ms 让尾包进 FIFO 播完
-      if (ttsDone && now - dlLastAudioAt > 1500 && ahead < MS2B(100)) {
-        endDlPlay("tts结束");
-        return;
-      }
-      // ---- ★V2.0.9 兜底分级：先看"链路死没死"，再谈"服务器卡了多久" ----
-      // 链路已断 + 协控也播空 ⇒ 会话真的没了，立刻收场（旧版在这里白等 5s）。
-      // 协控还有积压（ahead ≥50ms）则继续等它播完，别把已收的尾巴掐掉。
-      if (!wsReady && ahead < MS2B(50)) {
-        endDlPlay("连接已断");
-        return;
+      // ★★V2.4.3 本地媒体库场次（mLibState != 0）：下面两条"云端收场判据"必须跳过。
+      //   本地流的 PCM 直接从 HTTP socket 进 FIFO，**不经过 ws、也不依赖 TTS 状态**：
+      //   ① ttsDone 是"确认语说完"的残留，播放中恒 true；水位控制下 FIFO 满时本来就
+      //     0.5~1.5s 不读 socket ⇒ 随机撞上就 endDlPlay("tts结束")。
+      //   ② 播放期本机不发上行音频，官方服务器约 80s 踢掉 ws ⇒ wsReady=false，之后
+      //     任何一次积压掉到 50ms 以下就 endDlPlay("连接已断")。
+      //   两者都表现为"听几分钟自己停了"。本地流合法结束只有 mLibEnded（EOF）和
+      //   mLibTick 的 15s 无字节兜底，这里一律不管。
+      if (!mLibState) {
+        // tts stop 后仍有尾包迟到（实测 10 帧/1.8s），等 1500ms 让尾包进 FIFO 播完
+        if (ttsDone && now - dlLastAudioAt > 1500 && ahead < MS2B(100)) {
+          endDlPlay("tts结束");
+          return;
+        }
+        // ---- ★V2.0.9 兜底分级：先看"链路死没死"，再谈"服务器卡了多久" ----
+        // 链路已断 + 协控也播空 ⇒ 会话真的没了，立刻收场（旧版在这里白等 5s）。
+        // 协控还有积压（ahead ≥50ms）则继续等它播完，别把已收的尾巴掐掉。
+        if (!wsReady && ahead < MS2B(50)) {
+          endDlPlay("连接已断");
+          return;
+        }
       }
       if (now - dlLastAudioAt > DL_STALL_MAX_MS) {  // 连接仍在：给足恢复时间
         endDlPlay("流结束兜底");
@@ -1922,27 +2286,37 @@ static void pumpPlay() {
       if (now - dlStarvePrintAt > 2000) {
         dlStarvePrintAt = now;
         uint32_t gap = now - dlLastAudioAt;
-        Serial.printf("[DL] %s %ums（协控积压 %dms / FIFO %uB | WiFi %d RSSI %d | WS %s | "
-                      "堆 %u 连续 %u | 栈余 %u | 本会话最大帧 %u B%s）\n",
-                      gap > DL_STALL_WARN_MS ? "⚠️ 服务器停供" : "断粮", gap,
-                      (int)((int64_t)ahead * 1000 / dlRate), dlAvail(),
-                      (int)WiFi.status(), (int)WiFi.RSSI(), wsReady ? "连接" : "断开",
-                      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-                      (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)wsRxMaxAll,
-                      (wsRxMaxAll + 1 > heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
-                        ? " ⚠️顶到连续块" : "");
-        // ★V2.1.4 定案三件套（判读见 README）：
-        //   ①环正常 + 距pong <15s ⇒ 链路通、服务器进程活着 ⇒ 它只是不产音频（服务端侧）
-        //   ②环正常 + 距pong 持续增大 ⇒ 我们根本收不到包 ⇒ 看 ③
-        //   ③DMA 堆见底 ⇒ 网卡申请不到收发缓冲 ⇒ 内存水位就是真凶（V2.1.4 的 UP_SIZE 减半针对它）
-        //   ④环暴跌 ⇒ 是我们自己卡住，与服务器无关
-        Serial.printf("[DL]   链路: 主循环 %lu 圈/s | DMA 堆 %u 连续 %u | 距上次 pong %ldms"
-                      "（ping 发 %lu / 收 ping %lu / 收 pong %lu）\n",
-                      (unsigned long)loopRate,
-                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
-                      (long)(wsLastPongAt ? (int32_t)(millis() - wsLastPongAt) : -1),
-                      (unsigned long)wsPingTx, (unsigned long)wsPingRx, (unsigned long)wsPongRx);
+        // ★★V2.4.11 分场合打点：云端 TTS 场次才看 WS/pong/最大帧（V2.1.4 三件套）；
+        //   本地媒体库流的 PCM 走 HTTP socket、根本不经 ws —— "⚠️ 服务器停供 /
+        //   距上次 pong 796s / WS 断开"全是噪声，会把排障带到"云端链路断了"的错误方向
+        //   （2026-11-11 那次就是这么误判的）。改打 socket 可读字节、距上次收字节、
+        //   FIFO、RSSI，一眼分清"上游没产/没送到"与"已到货待喂"。
+        if (mLibState) {
+          Serial.printf("[DL][本地流] 断粮 %ums（FIFO %uB / socket 可读 %dB / 距上次收字节 %lums"
+                        " | WiFi %d RSSI %d | 协控积压 %dms | 主循环 %lu 圈/s | 本流已收 %lu B）\n",
+                        gap, dlAvail(), (int)mLibSockAvail,
+                        (unsigned long)(now - mLibBufAt),
+                        (int)WiFi.status(), (int)WiFi.RSSI(),
+                        (int)((int64_t)ahead * 1000 / dlRate),
+                        (unsigned long)loopRate, (unsigned long)mLibBytes);
+        } else {
+          Serial.printf("[DL] %s %ums（协控积压 %dms / FIFO %uB | WiFi %d RSSI %d | WS %s | "
+                        "堆 %u 连续 %u | 栈余 %u | 本会话最大帧 %u B%s）\n",
+                        gap > DL_STALL_WARN_MS ? "⚠️ 服务器停供" : "断粮", gap,
+                        (int)((int64_t)ahead * 1000 / dlRate), dlAvail(),
+                        (int)WiFi.status(), (int)WiFi.RSSI(), wsReady ? "连接" : "断开",
+                        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+                        (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)wsRxMaxAll,
+                        (wsRxMaxAll + 1 > heap_caps_get_largest_free_block(MALLOC_CAP_8BIT))
+                          ? " ⚠️顶到连续块" : "");
+          Serial.printf("[DL]   链路: 主循环 %lu 圈/s | DMA 堆 %u 连续 %u | 距上次 pong %ldms"
+                        "（ping 发 %lu / 收 ping %lu / 收 pong %lu）\n",
+                        (unsigned long)loopRate,
+                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                        (long)(wsLastPongAt ? (int32_t)(millis() - wsLastPongAt) : -1),
+                        (unsigned long)wsPingTx, (unsigned long)wsPingRx, (unsigned long)wsPongRx);
+        }
       }
       return;
     }
@@ -1950,7 +2324,7 @@ static void pumpPlay() {
     // aheadNow ≤ -50ms = 协控已空 ≥50ms（防把头推进仍有余量的活跃会话）；
     // 2000ms 超时兜底（基线估算漂移时强制推）。满水重启：推头前先攒 400ms——
     // 零水位起跑的新会话无法爬回高水位，第一个大发隙即排空死亡。
-    if (dlStarved && dlCutPhase == 0 && !ttsDone) {
+    if (!mLibState && dlStarved && dlCutPhase == 0 && !ttsDone) {
       bool drained = aheadNow <= -MS2B(50) || millis() - dlStarveMarkAt > 2000;
       bool enough = dlAvail() >= MS2B(400);
       if ((drained && enough) || (drained && millis() - dlStarveMarkAt > 2000)) {
@@ -1963,6 +2337,7 @@ static void pumpPlay() {
         dlInQuiet = false;
         dlStarved = false;
         dlStartAt = millis();
+        mLibAckBase += dlSentTotal;   // ★V2.4.11
         dlSentTotal = 0;  // 重锚基线：协控此刻播空=零点
         dlSentDbgPrev = dlSentTotal;
         Serial.printf("[DL] 段界 %lu：饿透恢复推头（标记后 %ums，FIFO %uB/%s）\n",
@@ -2062,10 +2437,12 @@ static void pumpTaskFunc(void*) {
       dlPumpBusy = false;
     }
     // 音量柱状图到点恢复状态图标：播放中 mtxFlush 会拒发，这里用快速路径补一帧。
+    // ★V2.4.7：恢复的一定是**当前该显示的东西** —— 本地流播放中就是 kind 图案，
+    //   不能画 mtxWant（那个早被服务器的情绪脸改掉了，于是"音量一调，书变笑脸"）。
     if (volIconAt && millis() - volIconAt > VOL_ICON_MS) {
       volIconAt = 0;
       if (dlActive) {
-        mtxSendFast(mtxPatternOf(mtxWant));
+        mtxSendFast(mtxPatternOf(mLibIconHold() ? mLibIconId() : mtxWant));
       } else {
         // ★V2.3.0：空闲时立刻补回（含清屏），不再只丢给 loop —— 播放刚好在这 1.2s 内
         //   结束时，旧写法会让柱状图一直挂到下一次状态变化，看着就是"播完了不灭"。
@@ -2089,6 +2466,13 @@ static void handleAudio(uint8_t* payload, size_t len) {
   }  // 录音中丢下行（半双工）
   if (dlBarged) {
     dlDropped++;  // 打断封锁：旧歌/旧话残帧全丢（服务器 abort 生效前在途帧），防播放复活
+    return;
+  }
+  // ★V2.4.7：本地媒体库场次 —— 云端残帧一个字节都不许掺进 FIFO（那条队列是共用的，
+  //   掺进去就是在歌里插几个字，或者干脆把本地流挤得断续）。等确认语那段 dlIsLocal
+  //   还是 false，云端那句"继续播放啦"照收，不受影响。
+  if (dlIsLocal) {
+    dlDropped++;
     return;
   }
   if (len < 2) return;
@@ -2364,6 +2748,7 @@ static bool ensureConnected() {
 // 按下 C 键：打断 TTS → listen start → 协控启动录音
 static void startTalk() {
   if (recPhase != 0) return;
+  if (mLibState) mLibStop("用户说话");      // ★V2.4.0 先停取流再打断播放
   bool wasPlaying = dlActive;               // 本轮打断前是否在播 TTS/音乐
   if (dlActive) stopDlPlayHard();  // 软打断 TTS
   if (!ensureConnected()) {
@@ -2588,17 +2973,54 @@ static void volService() {
 }
 
 static void pollButton() {
+  // ★V2.4.4 C 键：有声书在播/暂停时改成"暂停·继续"，短按长按都先停推流+报位置。
+  //   0=普通（按下即说话）1=本次按下刚暂停（长按到点说话）2=暂停态（短按继续，长按说话）
+  static uint32_t btnCHoldAt = 0;
+  static uint8_t  btnCMode = 0;
+  static bool     btnCLongDone = false;
+  const uint32_t BTN_C_LONG_MS = 700;
+
   bool b = digitalRead(BTN_PIN);
   if (b != btnStable) {
     if (btnEdgeAt == 0) btnEdgeAt = millis();
     else if (millis() - btnEdgeAt > 30) {
       btnStable = b;
       btnEdgeAt = 0;
-      if (btnStable == HIGH) startTalk();  // 按下=高电平=开始说话
-      else stopTalk();                     // 松开=低电平=停止，等 TTS
+      if (btnStable == HIGH) {                      // ---- 按下沿 ----
+        btnCHoldAt = millis();
+        btnCLongDone = false;
+        if (mLibKind == 3 && !mLibPaused && (mLibState || dlActive)) {
+          // 正在听书：按下即"停推流 + 记录位置"（短按长按都一样，先做这件事）
+          mLibPauseAndReport();
+          btnCMode = 1;
+        } else if (mLibKind == 3 && mLibPaused) {
+          btnCMode = 2;                             // 暂停态：短按=继续，长按=说话
+        } else {
+          btnCMode = 0;
+          startTalk();                              // 按下=高电平=开始说话
+        }
+      } else {                                      // ---- 松开沿 ----
+        if (btnCMode == 2 && !btnCLongDone && mLibPaused) {
+          mLibResumePlay();
+        } else if (btnCMode == 0 || btnCLongDone) {
+          stopTalk();                               // 松开=低电平=停止，等 TTS
+        }
+        btnCMode = 0;
+        btnCHoldAt = 0;
+      }
     }
   } else {
     btnEdgeAt = 0;
+    // 长按到点（按住不动也要判）：暂停态/刚暂停 → 直接开口说话。
+    // 此时推流已经停了，说话不会和播放打架。
+    if (btnStable == HIGH && btnCHoldAt && !btnCLongDone
+        && (uint32_t)(millis() - btnCHoldAt) > BTN_C_LONG_MS) {
+      btnCLongDone = true;
+      if (btnCMode == 1 || btnCMode == 2) {
+        btnCMode = 0;
+        startTalk();
+      }
+    }
   }
 
   // ★V2.2.3：B 键单击 = 音量 +（取消原来的"B 短按打断"，打断统一走 C）。
@@ -2648,11 +3070,13 @@ static void wsConnect() {
 static void sendHello() {
   // 上行 16k 编码；hello 声明 16k/60ms。sample_rate 若声明 24000，部分服务器需
   // 逐帧实时转码跟不上 → TTS 断续（本地 NAS 实测）
-  String hello = "{\"type\":\"hello\",\"version\":1,\"transport\":\"websocket\","
-                 "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
-                 "\"channels\":1,\"frame_duration\":60}}";
+  // ★V2.4.0：features.mcp 只在媒体库开启时声明 —— 关库时协议面与 V2.3.2 完全一致
+  String hello = "{\"type\":\"hello\",\"version\":1,\"transport\":\"websocket\",";
+  if (mLibOn) hello += "\"features\":{\"mcp\":true},";
+  hello += "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
+           "\"channels\":1,\"frame_duration\":60}}";
   ws.sendTXT(hello);
-  Serial.println("[WS] 已发送 hello");
+  Serial.printf("[WS] 已发送 hello（features.mcp=%s）\n", mLibOn ? "true" : "关闭");
 }
 
 static void sendListen(bool start) {
@@ -2759,6 +3183,1335 @@ static void markNotActivated(const String& code, const String& src) {
   Serial.println("==========================================");
 }
 
+// ========== 我的媒体库：语音开关 + 本地点播（V2.2.0）==========
+// 数据格式：MediaServer 的 `/ap/song` 给的是 **8bit / 24000 / 单声道裸 PCM**
+// （服务端 ffmpeg 现转码），所以这里**不做任何解码和重采样** —— 收到什么就往 dlFifo
+// 里塞什么，和 TTS 解码后的 8bit 输出完全同源，播放泵（pumpPlay）不需要知道这数据
+// 是"云端的"还是"曲库的"。这是整件事能做得这么小的根本原因。
+
+// 32 点正弦（-100..100）。8bit 提示音用它合成，避免引入 sinf（C3 无 FPU）。
+static const int8_t SINE32[32] = {
+    0, 20, 38, 56, 71, 83, 92, 98, 100, 98, 92, 83, 71, 56, 38, 20,
+    0, -20, -38, -56, -71, -83, -92, -98, -100, -98, -92, -83, -71, -56, -38, -20};
+
+// 媒体库主机：没显式配就用「当前本地小智服务器」那台（自建曲库通常与它同机/同 NAS）
+static String mLibHostNow() {
+  if (mLibHost.length()) return mLibHost;
+  if (!useSSL && curHost.length()) return curHost;
+  return String();
+}
+
+static void mLibSave() {
+  prefs.begin("cfg", false);
+  prefs.putBool("mlon", mLibOn);
+  prefs.putString("mlhost", mLibHost);
+  prefs.putUShort("mlport", mLibPort);
+  prefs.end();
+}
+
+// 开关提示音：两段 150ms 正弦。开=上行(660→880Hz)，关=下行(880→660Hz)。
+// 走同一条播放泵（先灌 FIFO 再 startDlPlay），所以它和 TTS 永远不会混音。
+static void mLibBeep(bool up) {
+  if (recPhase) return;
+  if (dlActive) stopDlPlayHard();   // 已在播：彻底停（清在途/清 RX）再播提示音，别硬切 0x10
+  const uint16_t n = (uint16_t)(dlRate * 150 / 1000);
+  const uint32_t f1 = up ? 660 : 880, f2 = up ? 880 : 660;
+  dlTail = dlHead = 0;
+  for (uint8_t seg = 0; seg < 2; seg++) {
+    uint32_t f = seg ? f2 : f1;
+    uint32_t step = (uint32_t)(((uint64_t)f * 32 << 16) / dlRate);  // Q16：每样本前进多少个表步
+    uint32_t ph = 0;
+    for (uint16_t i = 0; i < n; i++) {
+      uint16_t d = (i < (uint16_t)(n - i)) ? i : (uint16_t)(n - i);        // 距两端样本数
+      uint16_t amp = d >= 240 ? 42 : (uint16_t)((uint32_t)d * 42 / 240);   // 10ms 淡入淡出防爆音
+      ph += step;
+      int16_t s = SINE32[(ph >> 16) & 31];
+      fifoPush((uint8_t)(128 + (int16_t)((int16_t)s * (int16_t)amp) / 100));
+    }
+  }
+  mtxMusic = false;
+  dlBarged = false;
+  startDlPlay();
+  // 提示音是"已经喂完"的流：让泵播空后走正常收场（ttsDone 判据）
+  ttsDone = true;
+  dlFeedDone = true;
+}
+
+static void mLibStop(const char* why) {
+  bool had = (mLibState != 0);
+  // ★V2.4.6：有声书停播前，把"这一刻播到哪"排进上报队列 —— 服务端 v1.6.3 起只认设备
+  //   报的位置，它的字节数在本地文件上完全失真（ffmpeg 一次能把整集塞进 TCP 缓冲）。
+  //   此处 dlActive 还在 ⇒ mLibPlayedSec() 有效；歌单/电台不记位置。
+  if (had && dlActive && mLibKind == 3) mLibQueuePos(mLibBaseSec + mLibPlayedSec(), 0, 0);
+  mLibState = 0;
+  mLibWaitTts = false;
+  mLibEnded = false;
+  // ★V2.4.7：任何一次"停"都退出暂停态（说话/说停/换一条）。以前这里不清，暂停后
+  //   说句话 mLibPaused 会永远挂 true —— 短按 C 被当成"继续"，图标也会被暂停图案锁住。
+  //   mLibPauseAndReport 是"先 mLibStop 再置 true"，顺序上不受影响。
+  mLibPaused = false;
+  mLibAutoAt = 0;        // ★V2.4.5：任何"停"都取消自动续播（用户说话/说停/按 C 暂停都算）
+  mLibAutoReq = false;
+  mLibRetryGo = false;   // ★V2.4.10：断流重试同样取消（用户主动停了就不许再自己续）
+  mLibNowTitle = "";     // ★V2.4.10：没在播就没有"正在播放"信息
+  mLibPosBeatAt = 0;     // ★V2.4.9：停播即停心跳（下一条流起播时重新计时）
+  mLibLive = false;      // ★V2.4.1 电台标记只对本条流有效
+  mLibCkRem = 0;
+  mLibCkCRLF = 0;
+  mLibCkLineLen = 0;
+  // ★注意：不清 mLibKind/mLibQ/mLibPos —— 「停」完再说「下一首」还得有上下文
+  if (mLibCli.connected() || mLibCli.available()) mLibCli.stop();
+  dlSegHard = MS2B(DL_SEG_HARD_MS);   // 恢复 TTS 场次的会话保险丝
+  if (had) Serial.printf("[LIB] 停止取流(%s)：本首已收 %lu B\n", why, (unsigned long)mLibBytes);
+}
+
+// UTF-8 百分号编码（歌名是中文，必须编；只放行 unreserved 字符）
+static String mLibEnc(const String& s) {
+  static const char* hex = "0123456789ABCDEF";
+  String o;
+  o.reserve(s.length() * 3);
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~') {
+      o += (char)c;
+    } else {
+      o += '%';
+      o += hex[c >> 4];
+      o += hex[c & 0x0F];
+    }
+  }
+  return o;
+}
+
+// ★V2.4.10：URL 解码（服务端 X-Media-Title 里的中文是 %XX%XX… 三字节 UTF-8）
+static String mLibDec(const char* s) {
+  String o;
+  size_t n = strlen(s);
+  o.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    if (s[i] == '%' && i + 2 < n) {
+      char hx[3] = { s[i + 1], s[i + 2], 0 };
+      long v = strtol(hx, nullptr, 16);
+      if (v > 0) { o += (char)v; i += 2; continue; }
+    }
+    o += s[i];
+  }
+  return o;
+}
+// ★为什么不直接用 client.read(buf,len)：Node 默认对无 Content-Length 的响应上
+//   chunked 编码，裸读会把 "1a2b\r\n" 这类块头当 PCM 播成噪声。服务端虽然刻意
+//   关掉了 chunked（Connection: close + useChunkedEncodingByDefault=false），
+//   这里仍保留解码分支 —— 服务端换实现时不会把设备变成"沙沙声"。
+static size_t mLibPull(size_t want) {
+  mLibSockAvail = mLibCli.available();   // ★V2.4.11：只在这里（主循环）碰 socket
+  if (want > sizeof(mLibBuf)) want = sizeof(mLibBuf);
+  size_t out = 0;
+  if (!mLibChunked) {
+    int a = mLibCli.available();
+    if (a <= 0) {
+      if (!mLibCli.connected()) mLibEnded = true;
+      return 0;
+    }
+    if ((size_t)a > want) a = (int)want;
+    int r = mLibCli.read(mLibBuf, (size_t)a);
+    return r > 0 ? (size_t)r : 0;
+  }
+  while (out < want) {
+    if (mLibCkRem == 0) {
+      if (mLibCkCRLF) {   // 块数据尾的 CRLF：原样吃掉，别当空行（空行会被当成结束块）
+        if (!mLibCli.available()) break;
+        mLibCli.read();
+        mLibCkCRLF--;
+        continue;
+      }
+      if (!mLibCli.available()) break;
+      int c = mLibCli.read();
+      if (c < 0) break;
+      if (c == '\n') {
+        long v = strtol(mLibCkLine, nullptr, 16);
+        mLibCkLineLen = 0;
+        mLibCkLine[0] = 0;
+        if (v <= 0) {   // 0 长块 = 末块
+          mLibEnded = true;
+          break;
+        }
+        mLibCkRem = (uint32_t)v;
+      } else if (c != '\r') {
+        if (mLibCkLineLen < sizeof(mLibCkLine) - 1) {
+          mLibCkLine[mLibCkLineLen++] = (char)c;
+          mLibCkLine[mLibCkLineLen] = 0;
+        }
+      }
+      continue;
+    }
+    size_t w = mLibCkRem;
+    if (w > want - out) w = want - out;
+    int a = mLibCli.available();
+    if (a <= 0) break;
+    if ((size_t)a < w) w = (size_t)a;
+    int r = mLibCli.read(mLibBuf + out, w);
+    if (r <= 0) break;
+    out += (size_t)r;
+    mLibCkRem -= (uint32_t)r;
+    if (mLibCkRem == 0) mLibCkCRLF = 2;
+  }
+  return out;
+}
+
+// 起一条本地流：kind 1=歌单 2=电台 3=有声书（服务端 /ap/play 统一出口）
+// ★V2.4.4 设备事件上报：这块板子的 USB-Serial-JTAG 在应用运行时一个字节日志都取不到
+//   （三种 dtr/rts 组合都试过，见 README），所以关键事件直接丢给媒体库 ——
+//   服务端 console 会打，同时追加到 files/devlog.txt。「播几分钟就停」只看这一条就能定责。
+//   ★只在收场/暂停这类低频点调用（最坏阻塞 600ms），绝不能放进循环。
+static void mLibLog(const char* tag, const char* msg, long a, long b) {
+  if (!mLibOn) return;
+  String host = mLibHostNow();
+  if (!host.length()) return;
+  WiFiClient c;
+  if (!c.connect(host.c_str(), mLibPort, 800)) return;
+  String path = String("/ap/log?tag=") + tag + "&m=" + mLibEnc(String(msg ? msg : ""));
+  path += "&mac=" + mLibDevMac + "&ep=" + String(mLibPos) + "&kind=" + String(mLibKind);
+  if (a >= 0) path += "&a=" + String(a);
+  if (b >= 0) path += "&b=" + String(b);
+  c.print("GET " + path + " HTTP/1.1\r\nHost: " + host + ":" + String(mLibPort)
+          + "\r\nConnection: close\r\n\r\n");
+  uint32_t t0 = millis();
+  while (c.connected() && millis() - t0 < 600) { while (c.available()) c.read(); }
+  c.stop();
+}
+
+// ★V2.4.6：把一个「集内绝对位置」排进上报队列。
+//   绝对位置 = 服务端给的起点（mLibBaseSec = X-Resume-Offset）+ 本次实播（mLibPlayedSec）。
+//   ★服务端收到后**直接落库，不再加起播点** —— 以前两边都加，位置越滚越偏（这就是
+//     "起播点被算两遍"）。delayMs：暂停/说停传 0；本集播完传"FIFO 播空所需时间"。
+static void mLibQueuePos(float absPos, uint8_t fin, uint32_t delayMs, bool beat) {
+  if (!mLibOn || mLibKind != 3) return;
+  if (absPos < 0) absPos = 0;
+  mLibRptQ = mLibQ;          // 快照：之后 mLibQ 可能被下一条流覆盖
+  mLibRptEp = mLibPos;
+  mLibRptPos = absPos;
+  mLibRptPlay = (absPos > mLibBaseSec) ? (absPos - mLibBaseSec) : 0;
+  mLibRptFin = fin;
+  mLibRptBeat = beat;
+  mLibRptAt = millis() + delayMs;
+  Serial.printf("[LIB] 位置入队%s：第 %u 集 %.0fs%s（%lums 后上报）\n",
+                beat ? "（心跳）" : "", (unsigned)mLibRptEp, absPos,
+                fin ? "（本集播完）" : "", (unsigned long)delayMs);
+}
+
+// 到点把队列里的位置发给媒体库。连不上就丢弃 —— 位置不是关键路径，绝不堵播放。
+static void mLibPosTick() {
+  if (mLibRptPos < 0) return;
+  if ((int32_t)(millis() - mLibRptAt) < 0) return;
+  String host = mLibHostNow();
+  if (!host.length() || WiFi.status() != WL_CONNECTED) { mLibRptPos = -1; return; }
+  // ★V2.4.9：心跳是**播放中**发的，而这条 HTTP 是同步阻塞的 —— 最坏 300ms 会把音频泵
+  //   饿死（听感就是每 30s 卡一下）。所以心跳只在 FIFO 水位充足时才发，不够就等下一拍；
+  //   真事件（暂停/播完）不设这道闸。★水位用 500ms：FIFO 总共才 853ms（DL_SIZE=20480），
+  //   写 1.2s 这种阈值永远达不到 = 心跳永不触发。
+  bool beat = mLibRptBeat;
+  if (beat && dlActive && dlAvail() < MS2B(500)) return;
+  // sec = 本次会话实播（老服务端 v1.6.2 会自己加上起播点，正好对）
+  // abs = 集内绝对位置（v1.6.3 起直接用这个，不再叠加）—— 两版都能算对
+  String path = String("/ap/pos?q=") + mLibEnc(mLibRptQ) + "&ep=" + String(mLibRptEp)
+              + "&sec=" + String((unsigned long)(mLibRptPlay + 0.5f))
+              + "&abs=" + String((unsigned long)(mLibRptPos + 0.5f))
+              + "&fin=" + String((int)mLibRptFin)
+              + (beat ? "&beat=1" : "");   // ★V2.4.9：心跳 → 服务端只更新位置
+  WiFiClient c;
+  if (!c.connect(host.c_str(), mLibPort, beat ? 200 : 800)) { mLibRptPos = -1; return; }
+  c.print("GET " + path + " HTTP/1.1\r\nHost: " + host + ":" + String(mLibPort)
+          + "\r\nX-Dev-Mac: " + mLibDevMac + "\r\nConnection: close\r\n\r\n");
+  uint32_t t0 = millis();
+  uint32_t rto = beat ? 100 : 700;
+  while (c.connected() && millis() - t0 < rto) { while (c.available()) c.read(); }
+  c.stop();
+  Serial.printf("[LIB] 位置已上报%s：第 %u 集 %.0fs%s\n", beat ? "（心跳）" : "",
+                (unsigned)mLibRptEp, mLibRptPos, mLibRptFin ? "（本集播完）" : "");
+  mLibRptPos = -1;
+  mLibRptBeat = false;
+}
+
+// 本次会话**实际播出**的秒数（不含起点偏移）= 已发送量 - 超前量。// ★别用 (now-dlStartAt)/1000 —— 起播前预滚那段并没有放出来，会多算一个 FIFO。
+// ★★V2.4.11：前面所有"重锚"会把 dlSentTotal 清零，所以累计量 = mLibAckBase + 本段。
+//   mLibAckBase 只在新的一场本地流归零 ⇒ 位置单调不倒退，心跳/暂停/播完上报全受益。
+static float mLibPlayedSec() {
+  if (!dlActive) return 0;
+  uint32_t now = millis();
+  if (now < dlStartAt) return 0;
+  int32_t ahead = (int32_t)dlSentTotal
+                  - (int32_t)((uint64_t)(now - dlStartAt) * dlRate / 1000);
+  int32_t sent = (int32_t)dlSentTotal - (ahead > 0 ? ahead : 0);
+  if (sent < 0) sent = 0;
+  uint32_t total = mLibAckBase + (uint32_t)sent;
+  if (total == 0) return 0;
+  return (float)total / (float)dlRate;
+}
+
+// 有声书暂停：先量位置 → 停取流 → 立刻停播 → 上报 → 显示暂停图案。
+// 短按 C 和长按 C 都先走这一条（用户口径 2026-11-11：两种都要停推流 + 记位置）。
+static void mLibPauseAndReport() {
+  float played = mLibPlayedSec();
+  float absPos = mLibBaseSec + played;
+  mLibUserStop = true;
+  mLibStop("暂停");          // 断开 socket：服务端立刻停止转码/推流
+  stopDlPlayHard();          // 不能等 FIFO 播空 —— 用户按下就要静音
+  mLibPaused = true;
+  mLibBaseSec = absPos;      // 继续时以这里为起点
+  mtxSet(MTX_I_PAUSE);
+  mtxFlush();
+  Serial.printf("[LIB] 暂停：本集播 %.0fs + 起点 %.0fs = %.0fs\n", played, absPos - played, absPos);
+  mLibLog("PAUSE", "user-pause", (long)played, (long)absPos);
+}
+
+// 继续播放：从暂停点重连，服务端用 -ss 直接跳过去（不重新解整集）
+static void mLibResumePlay() {
+  if (!mLibPaused || mLibKind != 3) return;
+  float from = mLibBaseSec;
+  mLibPaused = false;
+  Serial.printf("[LIB] 继续：第 %u 集 +%.0fs\n", (unsigned)mLibPos, from);
+  mLibLog("RESUME", "user-resume", (long)from, (long)mLibPos);
+  // ★V2.4.7：继续播放**没有**确认语（这一下是本机按键触发的，云端不知道），
+  //   但也不能传 waitTts=false —— 那条路会置 ttsDone=false，把泵里"饿透重推头"那条
+  //   云端分支重新打开。所以走 waitTts=true + expectVoice=false：只等 250ms 攒预滚。
+  mLibPlayStream(3, mLibQ, mLibPos, true, from, false);
+}
+
+// ★V2.2.1 waitTts：true = 先抢跑缓冲，等云端确认语说完（ttsDone）再起播。
+//   点歌那条 1~3 秒的网络/转码延迟就藏进云端说话的时间里，接缝几乎听不出来。
+// ★V2.4.1 pos：歌单=跳过前 N 首（"下一首"就是 pos+=本批首数），有声书=从第 N 集起。
+static void mLibPlayStream(uint8_t kind, const String& q, uint16_t pos, bool waitTts, float seekSec,
+                           bool expectVoice) {
+  mLibStop("换一条");
+  // ★V2.4.7：正在放本地流时又来了新命令（"下一首 / 换个电台 / 换本书"）⇒ 立刻把旧场次收掉。
+  //   不收的话 FIFO 里还压着旧歌，云端那句确认语会被排在旧歌后面（听起来就是"没应答"），
+  //   而且 canStart 的 !dlActive 条件要等 1.5s 泵超时才满足。dlEndQuiet：屏幕别闪一下。
+  if (dlActive && dlIsLocal) {
+    dlEndQuiet = true;
+    endDlPlay("换一条");
+    dlEndQuiet = false;
+  }
+  mLibAutoReq = mLibAutoGo;   // ★V2.4.5：本次是不是自动续播（mLibStop 刚清掉，这里补回来）
+  mLibWaitTts = waitTts;
+  mLibExpectVoice = expectVoice;
+  if (waitTts) {
+    mLibPendingAt = millis();   // 兜底基准（云端不吭声也不能一直等）
+    mLibTtsSeq0 = ttsSeq;       // ★V2.4.7：记下"请求发出时的 TTS 轮次"，只等之后新开的那一轮
+    mLibTtsDone0 = ttsDone;     // 万一请求时云端正在说（llm 先开口再调工具），那条也得等
+    mLibSawReply = false;       // 之后每收到一条服务器文本就置 true（判"它到底说不说"）
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[LIB] WiFi 未连接，无法点播");
+    return;
+  }
+  String host = mLibHostNow();
+  if (!host.length()) {
+    Serial.println("[LIB] 未配置媒体库地址：配网门户「我的媒体库」填 host + port(默认 8100)");
+    return;
+  }
+  mLibKind = kind;
+  mLibQ = q;
+  mLibPos = pos;
+  mLibTracks = 0;
+  mLibPaused = false;
+  mLibUserStop = false;
+  // 本条流的起点秒：显式 seek（暂停后继续）优先，其它从 0 起（服务端会用自己的历史）
+  mLibBaseSec = (seekSec > 0) ? seekSec : 0;
+  mLibLive = (kind == 2);          // 电台是无限流：永远没有"本段结束"
+  mLibCurTitle = q;
+  mLibBytes = 0;
+  mLibAckBase = 0;                 // ★V2.4.11：新的一条流，实播累计从零开始
+  mLibDur = 0;                     // ★V2.4.10：本集时长（X-Book-Dur），断流判据用
+  mLibRetryN = 0;                  // ★V2.4.10：新一场，重试计数清零
+  mLibHdrLen = 0;
+  mLibHdr[0] = 0;
+  mLibChunked = false;
+  mLibEnded = false;
+  mLibStartAt = millis();
+  mLibBufAt = millis();
+
+  // ★三条腿共用一个出口：服务端已把「歌单连播 / 直播流 / 一本书的连续集」都整理成
+  //   一条 8bit/24k 裸 PCM 流，本机只要把 path 拼对，别的什么都不用管。
+  String path;
+  const char* kn;
+  if (kind == 2) {
+    kn = "电台";
+    path = "/ap/play?kind=radio&q=" + mLibEnc(q);
+  } else if (kind == 3) {
+    kn = "有声书";
+    path = "/ap/play?kind=book&q=" + mLibEnc(q) + "&ep=" + String(pos) + "&n=1";
+    // ★V2.4.4：暂停后继续 —— 集号由本机定，集内偏移也由本机定（服务端只管 -ss 跳过去）。
+    //   这样即使服务端还是老版本（没有 /ap/pos 历史），暂停/继续也不会跳回集首。
+    if (seekSec > 0) path += "&ss=" + String((long)seekSec);
+  } else {
+    kn = "歌单";
+    path = "/ap/play?kind=song&q=" + mLibEnc(q) + "&idx=" + String(pos) + "&n=6";
+  }
+  Serial.printf("[LIB] %s「%s」pos=%u → %s\n", kn, q.c_str(), pos, path.c_str());
+  // ★V2.2.1：超时 3000 → 1200ms。这是**阻塞式**连接，连不上时会把主循环连同
+  //   正在播的 TTS 一起卡住 3 秒（实测日志里就有一条 889ms 断粮紧跟着它）。
+  if (!mLibCli.connect(host.c_str(), mLibPort, 1200)) {
+    Serial.println("[LIB] 连不上媒体库（查地址/端口/容器是否在跑）");
+    mLibBeep(false);
+    mtxSetFace(MTX_P_FROWN);
+    mtxFlush();
+    return;
+  }
+  // ★V2.4.2：媒体库请求要报设备身份（服务端按 MAC 分设备记播放进度）。
+  //   deviceId() 是小写带冒号（"f0:9e:9e:cb:6f:bc"），这里转成 12 位大写十六进制，
+  //   服务端 devIdOf() 正好这么归一化，两边对得上。
+  {
+    String m = WiFi.macAddress();
+    m.replace(":", "");
+    m.toUpperCase();
+    mLibDevMac = m;
+    mLibDevName = "AlphaPi-STEM-" + m.substring(8);   // 末 4 位足够人眼区分
+    Serial.printf("[LIB] 设备身份：%s（%s）\n", mLibDevMac.c_str(), mLibDevName.c_str());
+  }
+  String req = "GET " + path + " HTTP/1.1\r\n"
+               "Host: " + host + ":" + String(mLibPort) + "\r\n"
+               "User-Agent: AlphaPi-STEM/2.4.13\r\n"
+               "X-Dev-Mac: " + mLibDevMac + "\r\n"
+               "X-Dev-Name: " + mLibDevName + "\r\n"
+               "Connection: close\r\n\r\n";
+  mLibCli.print(req);
+  mLibState = 1;
+  // waitTts 时**不能**清 ttsDone —— 那一位正是"云端确认语说完了没"的判据，
+  // 起播就等它变 true（见 mLibTick 的 canStart）。非 waitTts（STT 兜底）沿用原语义。
+  if (!waitTts) ttsDone = false;
+  // ★电台是无限流：会话保险丝不能按"一首歌"设，否则播到 7 分钟会被自己的硬顶掐断
+  dlSegHard = MS2B(mLibLive ? 3600000UL : DL_SEG_HARD_LOCAL_MS);
+}
+
+// 点一首歌（关键词）—— 兼容原来的调用点，内部就是"歌单从第 0 首起"
+static void mLibPlayQuery(const String& q, bool waitTts) {
+  mLibPlayStream(1, q, 0, waitTts);
+}
+
+// 下一首 / 下一集：带新的 pos 重连同一条队列（服务端按 pos 重新拼流）
+// 返回 false = 没有可切换的上下文（没点过歌 / 当前是电台）
+static bool mLibNext(bool waitTts) {
+  if (!mLibKind || mLibKind == 2) return false;
+  // 歌单：按**本条流实际包含的首数**跳（服务端在 X-Track-Count 里报），拿不到就按 6
+  uint16_t step = (mLibKind == 1) ? (mLibTracks ? mLibTracks : 6) : 1;
+  Serial.printf("[LIB] 下一个：%s pos %u → %u\n",
+                mLibKind == 1 ? "下一首" : "下一集", mLibPos, (unsigned)(mLibPos + step));
+  mLibPlayStream(mLibKind, mLibQ, (uint16_t)(mLibPos + step), waitTts);
+  return true;
+}
+
+
+// 非阻塞取流泵：等头 → 边收边喂（FIFO 有空间才读 = 天然背压）→ 攒够预滚起播 → 收尾
+static void mLibTick() {
+  uint32_t now = millis();
+
+  // ---- ★V2.4.5 有声书自动续播：上一集真播完（服务端 EOF）→ 接下一集 ----
+  //   必须放在 `if (!mLibState) return;` **之前**：排这个待办的时候本条流已经收场、
+  //   状态早就清零了，放后面永远轮不到。
+  //   注意 mLibUserStop：按 C 暂停 / 说"停"是用户意图，不许自动接下一集。
+  if (mLibAutoAt && (int32_t)(now - mLibAutoAt) >= 0) {
+    mLibAutoAt = 0;
+    if (mLibKind == 3 && mLibQ.length() && !mLibUserStop && !mLibPaused
+        && WiFi.status() == WL_CONNECTED) {
+      if (mLibRetryGo) {
+        // ★V2.4.10 断流自愈：同一集、从断流点原地续播（不跳集、不报 fin）
+        mLibRetryGo = false;
+        Serial.printf("[LIB] 断流续播：第 %u 集 %.0fs 处接着听\n",
+                      (unsigned)mLibPos, (double)mLibRetrySs);
+        mLibPlayStream(3, mLibQ, mLibPos, false, mLibRetrySs);
+      } else {
+        Serial.printf("[LIB] 自动续播：第 %u 集播完 → 第 %u 集\n",
+                      (unsigned)mLibPos, (unsigned)(mLibPos + 1));
+        mLibAutoGo = true;
+        mLibPlayStream(3, mLibQ, (uint16_t)(mLibPos + 1), false);
+        mLibAutoGo = false;
+      }
+    }
+  }
+
+  if (!mLibState) return;
+
+  // ---- 状态 1：等响应头（只关心状态码 / 是否 chunked，body 一个字节都不碰）----
+  if (mLibState == 1) {
+    while (mLibCli.available()) {
+      int c = mLibCli.read();
+      if (c < 0) break;
+      if (mLibHdrLen < sizeof(mLibHdr) - 1) {
+        mLibHdr[mLibHdrLen++] = (char)c;
+        mLibHdr[mLibHdrLen] = 0;
+      }
+      uint16_t L = mLibHdrLen;
+      if (L >= 4 && mLibHdr[L - 4] == '\r' && mLibHdr[L - 3] == '\n'
+          && mLibHdr[L - 2] == '\r' && mLibHdr[L - 1] == '\n') break;
+      if (L >= sizeof(mLibHdr) - 1) break;
+    }
+    uint16_t L = mLibHdrLen;
+    bool hdrDone = (L >= 4 && mLibHdr[L - 4] == '\r' && mLibHdr[L - 3] == '\n'
+                    && mLibHdr[L - 2] == '\r' && mLibHdr[L - 1] == '\n');
+    // ★V2.4.11：万一还是顶满，也按"已收部分"解析（关键头都排在前面），别等 15s 超时
+    //   把整场播放判死。剩下的头尾字节会混进 PCM 开头，属于可接受的降级。
+    if (!hdrDone && L >= (uint16_t)sizeof(mLibHdr) - 1) {
+      Serial.printf("[LIB] ⚠️ 响应头超长（%u B），按已收部分解析\n", (unsigned)L);
+      hdrDone = true;
+    }
+    if (!hdrDone) {
+      if (now - mLibStartAt > 15000) {
+        Serial.printf("[LIB] 等响应头超时（已收 %u B）\n", (unsigned)mLibHdrLen);
+        mLibStop("等头超时");
+        mLibBeep(false);
+      }
+      return;
+    }
+    int code = 0;
+    { const char* sp = strchr(mLibHdr, ' ');
+      if (sp) code = atoi(sp + 1); }
+    // chunked 判定用全小写副本（新 libc 不一定提供 strcasestr）
+    {
+      char low[sizeof(mLibHdr)];
+      uint16_t i;
+      for (i = 0; i < L && i < sizeof(low) - 1; i++) {
+        char c = mLibHdr[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+      }
+      low[i] = 0;
+      mLibChunked = (strstr(low, "transfer-encoding: chunked") != nullptr);
+      // ★V2.4.1：本条流实际包含几首（服务端 X-Track-Count）——
+      //   "下一首"要按**实际**首数跳，不能死按 6（最后一批可能只有 2 首）
+      mLibTracks = 0;
+      const char* tcn = strstr(low, "x-track-count:");
+      if (tcn) mLibTracks = (uint16_t)atoi(tcn + 14);
+      /* ★V2.4.2：有声书续播时服务端会自己把集号往前跳（上次那集），
+         本机必须把 mLibPos 同步成**实际起播的集号** —— 否则接着说「下一集」
+         会拿 mLibPos=0 算出第 1 集，整本书被跳过。 */
+      const char* bep = strstr(low, "x-book-ep:");
+      if (bep) {
+        uint16_t ep = (uint16_t)atoi(bep + 10);
+        if (ep && ep != mLibPos) {
+          Serial.printf("[LIB] 续播定位：第 %u 集（原请求 pos=%u）\n", (unsigned)ep, (unsigned)mLibPos);
+          mLibPos = ep;
+        }
+      }
+      /* ★V2.4.4：服务端自己跳了位置（续播）就把它记成起点 —— 「按 C 暂停」上报
+         和「继续播放」的 ss 都用这个基准，否则会把整段位置算成 0。 */
+      const char* rof = strstr(low, "x-resume-offset:");
+      if (rof) {
+        float off = (float)atol(rof + 16);
+        if (off > 0) {
+          mLibBaseSec = off;
+          Serial.printf("[LIB] 起点偏移 %.0fs（服务端续播）\n", off);
+        }
+      }
+      /* ★V2.4.10：本集时长 —— 流结束时拿"收到的字节数"跟它对账，
+         区分「真播完」和「流被提前掐断」（后者不许报 fin、不许跳下一集）。 */
+      const char* bdur = strstr(low, "x-book-dur:");
+      if (bdur) mLibDur = (uint16_t)atoi(bdur + 11);
+      /* ★V2.4.10：当前播放信息（服务端 v1.6.5 起）—— 歌名-歌手 / 书名·演播·第N集 / 台名。
+         MCP 的 current_play 工具答「现在放的是什么」就用它；低副本里 %XX 的十六进制
+         字母被小写化没关系（解码按 16 进制认）。标题行以 \r\n 结尾。 */
+      const char* mt = strstr(low, "x-media-title:");
+      if (mt) {
+        char v[700];
+        size_t vi = 0;
+        for (const char* p = mt + 14; *p && *p != '\r' && *p != '\n' && vi < sizeof(v) - 1; p++) {
+          v[vi++] = *p;
+        }
+        v[vi] = 0;
+        mLibNowTitle = mLibDec(v);
+      }
+    }
+    if (code != 200) {
+      // ★V2.4.5：自动续播撞上 404 = 这本书已经到最后一集了（服务端明确回"没有第 N 集"）。
+      //   那是正常收尾，不该给用户来一个失望脸 + 错误蜂鸣。
+      bool tail = mLibAutoReq;
+      Serial.printf("[LIB] 媒体库返回 HTTP %d（%s）\n", code,
+                    tail ? "自动续播到头，全书播完" : "没搜到 / 取链失败，看服务端日志");
+      mLibStop("HTTP 非 200");
+      if (tail) {
+        mtxSetFace(MTX_P_SMILE);
+      } else {
+        mLibBeep(false);
+        mtxSetFace(MTX_P_FROWN);
+      }
+      mtxFlush();
+      return;
+    }
+    Serial.printf("[LIB] 开始取流（%s）\n", mLibChunked ? "chunked" : "裸流");
+    mLibState = 2;
+    mLibBufAt = now;
+    return;
+  }
+
+  // ---- 状态 2：边收边喂（**水位控制** = 按播放速率喂，绝不灌爆）----
+  // ★★V2.2.1 这是"正确给协控喂音频"的核心，和小智 TTS 的节奏保持一致：
+  //   起播前把 FIFO 填满（攒够预滚再开播）；起播后只在**水位低于 3/4** 时补回去。
+  //   播放端只按 24000 B/s 消费 ⇒ 补多少就等于消费多少，读 socket 的速率被
+  //   自然钳在 24KB/s，服务端也被 TCP 窗口背压成实时。
+  //   V2.2.0 的写法是"有多少空位就读多少"，而 /ap/song 是整首 6.4MB 全速推的，
+  //   缓冲被灌爆 ⇒ WiFi/TCP 拥塞 + FIFO 反复打满丢样 ⇒ 实机"破音严重且卡顿"。
+  const uint16_t LIB_LOOP_BUDGET = 4096;   // 单圈最多 4KB≈170ms，别让一轮读太久
+  const uint16_t libTarget = dlActive ? (uint16_t)(DL_SIZE * 3 / 4)
+                                      : (uint16_t)(DL_SIZE - 1);
+  // ★★V2.4.7：等确认语期间**一个字节都不许进 FIFO**。
+  //   以前这里是"早就抢跑灌满"：FIFO 是 TTS 和本地流共用的一条队列，把歌提前塞进去，
+  //   云端那句"继续播放啦"就跟歌搅在同一口锅里 —— 要么话被顶断，要么歌里混着人声。
+  //   现在干脆不读 socket：TCP 背压会让服务端/ffmpeg 自己停下来等，数据一个不丢。
+  //   ★为什么要连"tts stop 之后、尾音还没播完"那段也挂住：tts start 到达时
+  //     `if (!dlActive) dlTail = dlHead;` 会清 FIFO 里的残留帧 —— 那时里面装的正是我们
+  //     提前读进来的歌，一清就等于把开头几百毫秒**真丢了**（socket 里没有第二份）。
+  //     所以宁可晚 100ms 读，也不提前读：确认语说完后重新灌 700ms 预滚只要几毫秒。
+  // ★★V2.4.8（2026-11-11 当晚修）：这里的条件**不能**是裸的 mLibWaitTts。
+  //   起播要 FIFO 攒够 700ms 预滚，而预滚只能从 socket 读 —— 无条件"等话期间不读"
+  //   就构成死锁：确认语一说完 ⇒ 等 FIFO 有数据 ⇒ 可它永远不去读。
+  //   实机表现：说"继续播放"后十几秒一点动静都没有（其实永不开始，因为挂起期间
+  //   每拍都刷新 mLibBufAt，连 15s 取流超时都不会触发）。
+  //   判据必须和下面 canStart **严格对称**，只在"确实还在等这句话"时挂住：
+  //     ① 这一轮已经开口：stop 未到，或 stop 到了但尾音还在协控里播（dlActive）；
+  //     ② 这一轮还没开口：只在"它可能马上就开口"的窗口内挂住（无动静 0.5s /
+  //        服务器在生成 6s），窗口一过就当它不说话，立刻读 socket 灌预滚；
+  //     ③ 20s 绝对兜底（服务器漏发 stop 也不能一直哑着）。
+  uint32_t libWaited = (uint32_t)(now - mLibPendingAt);
+  bool libSpeaking = (ttsSeq != mLibTtsSeq0) || !mLibTtsDone0;
+  bool holdTts = false;
+  if (mLibWaitTts && libWaited <= 20000) {
+    if (libSpeaking) holdTts = (!ttsDone || dlActive);   // 话没说完 / 尾音还在播
+    else if (mLibExpectVoice) holdTts = libWaited <= (mLibSawReply ? 6000 : 500);
+  }
+  if (holdTts) {
+    mLibBufAt = now;   // 挂起不算"15s 没收到数据"
+  } else if (dlAvail() < libTarget) {
+    uint16_t budget = LIB_LOOP_BUDGET;
+    while (budget && dlAvail() < libTarget) {
+      uint16_t room = (uint16_t)(libTarget - dlAvail());
+      size_t want = room < sizeof(mLibBuf) ? (size_t)room : sizeof(mLibBuf);
+      if (want > budget) want = budget;
+      size_t got = mLibPull(want);
+      if (!got) break;
+      for (size_t i = 0; i < got; i++) fifoPush(mLibBuf[i]);
+      mLibBytes += (uint32_t)got;
+      budget -= (uint16_t)got;
+      mLibBufAt = now;
+      dlLastAudioAt = now;   // 播放泵的"流还活着"判据（gapAlign / 硬顶都读它）
+    }
+  }
+
+  // ---- 起播门槛：攒够 700ms 再开（沿用 TTS 的 jitter 思路）；流尾不足 700ms 也照播 ----
+  // ★V2.2.1：门槛要按 FIFO 容量钳制 —— DL_SIZE 缩到 14KB 后 16800B 永远攒不到，
+  //   本地点歌就会退化成"整首下完才开播"（等于点歌没反应）。
+  int32_t libGate = MS2B(700);
+  if (libGate > (int32_t)(DL_SIZE - PLAY_CHUNK - 1)) libGate = (int32_t)(DL_SIZE - PLAY_CHUNK - 1);
+  // ★★V2.4.7：确认语说完（tts stop）且 FIFO 已播空 ⇒ **立刻**收掉 TTS 场次，把总线让给本地流。
+  //   不这么做就要等泵那条"ttsDone && 1.5s 无新字节"的收场判据，用户会听到 1.5s 空白。
+  //   dlEndQuiet：别清屏、别写媒体库日志 —— 下一拍 startDlPlay 就要上音符/书/收音机图案了。
+  //   ★积压 ≤120ms 才收：dlAvail()==0 只说明"字都发出去了"，协控自己那几帧还在播；
+  //     这时候推新 WAV 头 = 会话中途插头（总纲里明令禁止的"会话杀手"）。
+  {
+    int32_t aheadTts = (int32_t)dlSentTotal
+                       - (int32_t)((uint64_t)(now - dlStartAt) * dlRate / 1000);
+    bool ttsOver = ttsDone && dlAvail() == 0 && aheadTts <= MS2B(120);
+    // 20s 硬出口：服务器极端情况下不发 stop（漏了 stop / 说个没完），不能永远哑着 ——
+    // 那时先把 TTS 场次收掉，让下面的 canStart 兜底把本地流放出来。
+    bool forceOver = (uint32_t)(now - mLibPendingAt) > 20000;
+    if (mLibWaitTts && dlActive && (ttsOver || forceOver)) {
+      dlEndQuiet = true;
+      endDlPlay("确认语说完");
+      dlEndQuiet = false;
+    }
+  }
+  // ★★V2.4.7：起播判据改看**轮次**，不能再信 ttsDone。
+  //   工具被调用的那一刻，上一轮的 tts stop 还挂在 ttsDone 上（true）⇒ 旧判据当场放行，
+  //   局域网 0.3s 就攒够 700ms 预滚 ⇒ 本地音乐抢在"继续播放啦"第一个字上桌把它顶断。
+  //   现在：这一轮已经开口（ttsSeq 变了）就必须等它 stop 且 FIFO 播空；
+  //         一轮都没开口（LLM 只调工具不说话）则 0.5s 后照播；服务器明明在生成
+  //         （mLibSawReply）就耐心等 6s；20s 绝对兜底（漏发 stop 也不能一直哑着）。
+  //   ★V2.4.8：判据与上面 holdTts 共用 libWaited / libSpeaking（两边必须一致，
+  //     否则一边放行、另一边还挂着，就又成了"判据放行了但没数据"的死相）。
+  bool canStart = true;
+  if (mLibWaitTts) {
+    if (libSpeaking) canStart = ttsDone && !dlActive;            // 等它说完、且 FIFO 播空
+    else if (!mLibExpectVoice) canStart = libWaited > 250;        // 本机自发的（继续播放）：等预滚就够
+    else canStart = libWaited > (mLibSawReply ? 6000 : 500);      // 它在说话的路上就多等，完全没动静就别干等
+    if (libWaited > 20000) canStart = true;
+  }
+  if (!dlActive && canStart && (dlAvail() >= libGate || (mLibEnded && dlAvail() > 0))) {
+    mLibWaitTts = false;
+    mtxMusic = true;       // 点阵：播放中（startDlPlay 据此选图案）
+    // ★V2.4.4：三种本地流各用各的图案 —— 音符 / 摊开的书 / 收音机（用户 2026-11-11 选定）
+    mtxSet(mLibKind == 3 ? MTX_I_BOOK : (mLibKind == 2 ? MTX_I_RADIO : MTX_I_MUSIC));
+    dlBarged = false;
+    startDlPlay();
+    if (dlActive) {
+      if (mLibKind == 3) mLibPosBeatAt = now + LIB_POS_BEAT_MS;   // ★V2.4.9 起播即开始计时
+      Serial.printf("[LIB] 起播（预滚 %lums，抢跑 %lums）\n",
+                    (unsigned long)((uint64_t)dlAvail() * 1000 / dlRate),
+                    (unsigned long)(now - mLibStartAt));
+    }
+  }
+
+  // ★★V2.4.9：有声书播放中每 30s 报一次"听到哪了"（心跳）。
+  //   没有它，设备一断电这段进度就全丢（服务端只知道起播点）。最坏只丢 30s。
+  //   ★队列里已有待发上报（暂停/播完，mLibRptPos>=0）时不许插队 —— 真事件优先。
+  if (mLibKind == 3 && dlActive && mLibPosBeatAt
+      && (int32_t)(now - mLibPosBeatAt) >= 0) {
+    mLibPosBeatAt = now + LIB_POS_BEAT_MS;
+    if (mLibRptPos < 0) mLibQueuePos(mLibBaseSec + mLibPlayedSec(), 0, 0, true);
+  }
+
+  // ---- 收尾：末块/对端关闭 ⇒ 交给播放泵把 FIFO 播空后 endDlPlay ----
+  if (mLibEnded) {
+    while (mLibCli.available()) mLibCli.read();   // 丢掉 chunked 尾巴/trailer
+    if (mLibCli.connected()) mLibCli.stop();
+    uint32_t ms = millis() - mLibStartAt;
+    bool wasLive = mLibLive;
+    // ★V2.4.5：有声书的服务端 EOF = **这一集真播完了**（不是被打断）⇒ 排下一集。
+    //   要等 FIFO 里剩下的音频播空再重连：立刻重连会把结尾切掉，也会让播放泵
+    //   在两段流之间插一个断口。400ms 是不把话头咬掉的余量。
+    if (mLibKind == 3 && !wasLive) {
+      // ★★V2.4.10 断流对账：收到字节数离"播完整集"还差 15s 以上 = 流被提前掐断
+      //   （服务端/网络抖动），绝不是"本集播完" —— 实测 13.8 分钟的集子断在 6.8 分钟，
+      //   旧逻辑照报 fin=1，服务端把记录标成已播完、续播直接跳走一整集。
+      // ★★V2.4.13：`MS2B(uint32_t ms)` 的单位是**毫秒**！V2.4.10 这里写的
+      //   MS2B(15)/MS2B(30) 本意是「差 15 秒 / 至少 30 秒」，实际只有 360B/720B
+      //   = 15ms/30ms 音频 ⇒ 一次正常 EOF 只要尾部少收 15ms 就被判成断流。
+      //   后果链：不报 fin → ss≈集尾原地续播 → 服务端夹到 dur-30 → 倒回 30 秒
+      //   重播本集 → 30s 后又是 EOF → 循环 3 次，永远不跳下一集。
+      float spanSec = (float)mLibDur - mLibBaseSec;
+      if (spanSec < 0) spanSec = 0;
+      float expect = spanSec * (float)dlRate;
+      float nowSec = mLibBaseSec + mLibPlayedSec();
+      // ★已经听到集尾 5s 内 ⇒ 无论字节差多少都按「本集播完」收场，绝不原地续播。
+      //   断流重试的 ss 本来就落在集尾附近，再夹一次只会无限重播同一段。
+      bool atTail = (mLibDur > 0 && nowSec >= (float)mLibDur - 5);
+      bool cutShort = mLibDur > 0 && !atTail
+                      && (float)mLibBytes < expect - (float)MS2B(15000)
+                      && expect > (float)MS2B(30000);
+      Serial.printf("[LIB] 断流对账：dur=%us base=%.0fs bytes=%.0fs expect=%.0fs now=%.0fs"
+                    " atTail=%d cutShort=%d\n",
+                    (unsigned)mLibDur, mLibBaseSec, (float)mLibBytes / (float)dlRate,
+                    expect / (float)dlRate, nowSec, (int)atTail, (int)cutShort);
+      if (cutShort && mLibRetryN < 3) {
+        mLibRetryN++;
+        mLibRetryGo = true;
+        mLibRetrySs = mLibBaseSec + mLibPlayedSec();
+        // ★V2.4.13：断点不许贴到集尾（服务端会夹 off，两边一起夹才不会越界）
+        if (mLibDur > 0) {
+          float cap = (float)mLibDur - 3;
+          if (cap < 0) cap = 0;
+          if (mLibRetrySs > cap) mLibRetrySs = cap;
+        }
+        uint32_t rest = 2000;    // 给 WiFi/服务端 2s 喘息再原地续播
+        mLibAutoAt = millis() + rest;
+        // ★不报 fin：位置照报（fin=0），服务端把记录停在真实听到的位置
+        mLibQueuePos(mLibBaseSec + mLibPlayedSec(), 0, 0);
+        Serial.printf("[LIB] ⚠️ 断流（收 %.0fs / 全集应 %.0fs，第 %u 集）→ 2s 后原地续播\n",
+                      (float)mLibBytes / (float)dlRate, expect / (float)dlRate,
+                      (unsigned)mLibPos);
+        (void)rest;
+      } else if (cutShort) {
+        // 重试 3 次都断：放弃，但不许污染播放记录 —— 报"听到这里"（fin=0）+ 失望脸
+        mLibQueuePos(mLibBaseSec + mLibPlayedSec(), 0, 0);
+        mLibAutoAt = 0;
+        mtxSetFace(MTX_P_FROWN);
+        mtxFlush();
+        Serial.println("[LIB] 断流重试 3 次仍失败，收场（记录停在断点）");
+      } else {
+        uint32_t rest = (uint32_t)((uint64_t)dlAvail() * 1000 / dlRate) + 400;
+        if (rest > 60000) rest = 60000;
+        mLibAutoAt = millis() + rest;
+        mLibRetryN = 0;      // 真播完：重试计数清零
+        // ★V2.4.6：本集真播完 ⇒ 报 fin=1（服务端下次续播跳下一集）。
+        //   位置也要等 FIFO 播空再报：现在报会把尾巴（还在缓冲里）漏掉，续播会重听几秒。
+        // ★★V2.4.11：真播完时位置**直接取集尾**，不再用"起点 + 实播累加"。
+        //   cutShort 已经拿 socket 字节数与 X-Book-Dur 对过账、确认不是断流；此时再用
+        //   易受重锚/心跳影响的累加值，只会把 828s 报成 602s ⇒ 服务端把 fin 拦下、
+        //   下次续播倒回这一集。dur 未知（老服务端）才退回累加以保兼容。
+        float donePos = (mLibDur > 0) ? (float)mLibDur
+                                      : (mLibBaseSec + mLibPlayedSec());
+        mLibQueuePos(donePos, 1, rest);
+        Serial.printf("[LIB] 本集播完，%lums 后自动接第 %u 集\n",
+                      (unsigned long)rest, (unsigned)(mLibPos + 1));
+      }
+    }
+    mLibState = 0;
+    mLibLive = false;
+    dlSegHard = MS2B(DL_SEG_HARD_MS);
+    ttsDone = true;
+    dlFeedDone = true;
+    Serial.printf("[LIB] %s结束：%lu B / %lums（%lu B/s）\n",
+                  wasLive ? "电台（上游断流）" : "点播",
+                  (unsigned long)mLibBytes, (unsigned long)ms,
+                  (unsigned long)(ms ? (uint64_t)mLibBytes * 1000 / ms : 0));
+    return;
+  }
+  if (now - mLibBufAt > 15000) {
+    Serial.println("[LIB] 15s 没收到数据，放弃本首");
+    mLibStop("取流超时");
+    mtxSetFace(MTX_P_FROWN);
+    mtxFlush();
+  }
+}
+
+// 开关指令识别：0=不是 1=开 2=关。必须先认出「媒体库/曲库」这个对象词，
+// 否则"关闭蓝牙"之类的普通指令会被误判成关媒体库。
+static int mLibCmdKind(const String& t) {
+  if (t.indexOf("媒体库") < 0 && t.indexOf("曲库") < 0) return 0;
+  static const char* off[] = {"关闭", "关掉", "关上", "停用", "禁用", "不要用", "别用", "不用"};
+  static const char* on[] = {"启用", "打开", "开一下", "开启", "使用", "用上", "切到", "换成"};
+  for (uint8_t i = 0; i < sizeof(off) / sizeof(off[0]); i++)
+    if (t.indexOf(off[i]) >= 0) return 2;
+  for (uint8_t i = 0; i < sizeof(on) / sizeof(on[0]); i++)
+    if (t.indexOf(on[i]) >= 0) return 1;
+  return 0;
+}
+
+// 点歌意图 → 关键词。返回 false = 不接（交还云端，保持原有对话能力）。
+// ★宁可漏接不可误接：一旦接了就 abort 云端，误判的代价是"这句话没回答"。
+static bool mLibSongQuery(const String& t, String& q) {
+  static const char* neg[] = {"怎么", "为什么", "什么", "如何", "能不能", "可以吗",
+                              "有没有", "是不是", "关掉", "关闭", "停用"};
+  for (uint8_t i = 0; i < sizeof(neg) / sizeof(neg[0]); i++)
+    if (t.indexOf(neg[i]) >= 0) return false;
+  static const char* kw[] = {"播放一首", "播放首", "播放一下", "播放", "放一首", "放首",
+                             "来一首", "来首", "点一首", "点首", "点歌", "唱一首", "唱首",
+                             "听一首", "听首", "放个", "来点"};
+  int best = -1;
+  uint8_t bestLen = 0;
+  for (uint8_t i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
+    int p = t.indexOf(kw[i]);
+    if (p >= 0 && (best < 0 || p < best)) {
+      best = p;
+      bestLen = (uint8_t)strlen(kw[i]);
+    }
+  }
+  if (best < 0) return false;
+  String r = t.substring(best + bestLen);
+  // 量词/助词（长串在前，且**不含单独的"歌"**——"播放歌唱祖国"会被啃掉一个字）
+  static const char* lead[] = {"一首", "一曲", "一个", "首歌", "歌曲", "首", "曲",
+                               "下", "点", "些", "个", "的"};
+  static const char* tail[] = {"这首歌", "的歌曲", "吧", "呗", "呀", "啊", "哦", "嘛",
+                               "。", "，", "！", "？", "?", "!", " "};
+  bool ch = true;
+  while (ch) {
+    ch = false;
+    r.trim();
+    for (uint8_t i = 0; i < sizeof(lead) / sizeof(lead[0]); i++) {
+      if (r.startsWith(lead[i])) {
+        r = r.substring(strlen(lead[i]));
+        ch = true;
+        break;
+      }
+    }
+  }
+  ch = true;
+  while (ch) {
+    ch = false;
+    r.trim();
+    for (uint8_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) {
+      if (r.endsWith(tail[i])) {
+        r = r.substring(0, r.length() - strlen(tail[i]));
+        ch = true;
+        break;
+      }
+    }
+  }
+  r.trim();
+  if (!r.length() || r.length() > 30) return false;
+  q = r;
+  return true;
+}
+
+// ---------------- V2.4.12：进度 / 时长 / 信号强度 的公共口径 ----------------
+
+// 秒 → 「1小时5分30秒」，给小智念出来比裸秒数自然
+static String mLibFmtSec(float s) {
+  if (s < 0) s = 0;
+  long v = (long)(s + 0.5f);
+  long h = v / 3600, m = (v % 3600) / 60, sec = v % 60;
+  String r;
+  if (h) r += String(h) + "小时";
+  if (h || m) r += String(m) + "分";
+  r += String(sec) + "秒";
+  return r;
+}
+
+// 集内绝对位置 = 本条流起点 + 本次实播。
+// ★暂停时 mLibPauseAndReport 已把 mLibBaseSec 写成暂停位置、mLibPlayedSec() 为 0 ⇒ 仍正确。
+// ★V2.4.11 起 mLibPlayedSec() 用 mLibAckBase 单调累计，重锚不再让位置倒退。
+static float mLibNowSec() {
+  return mLibBaseSec + mLibPlayedSec();
+}
+
+// 从一段 JSON 里取**带符号 / 带小数**的数字（jsonInt 只认正整数，后退的 -30 会被吃掉）
+static bool mLibJsonNum(const String& s, const char* key, float& out) {
+  String pat = String("\"") + key + "\":";
+  int i = s.indexOf(pat);
+  if (i < 0) return false;
+  i += pat.length();
+  while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\"')) i++;
+  int j = i;
+  if (j < (int)s.length() && (s[j] == '-' || s[j] == '+')) j++;
+  bool any = false;
+  while (j < (int)s.length() && (isDigit(s[j]) || s[j] == '.')) {
+    if (isDigit(s[j])) any = true;
+    j++;
+  }
+  if (!any) return false;
+  out = s.substring(i, j).toFloat();
+  return true;
+}
+
+// 口令里的数量：先认阿拉伯数字，再认中文数字（含「十/百」组合）。找不到返回 -1。
+// 用 indexOf/逐段比较而不是按 3 字节步进，混了 ASCII 也不会错位。
+static long mLibParseNum(const String& src) {
+  for (unsigned i = 0; i < src.length(); i++) {
+    if (isDigit(src[i])) {
+      long v = 0;
+      while (i < src.length() && isDigit(src[i])) { v = v * 10 + (src[i] - '0'); i++; }
+      return v;
+    }
+  }
+  String s = src;
+  s.replace("两", "二");
+  static const char* dg[] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+  long total = 0, cur = 0;
+  bool hit = false;
+  for (unsigned i = 0; i < s.length();) {
+    int d = -1;
+    for (int k = 0; k < 10; k++) {
+      unsigned L = strlen(dg[k]);
+      if (i + L <= s.length() && s.substring(i, i + L) == dg[k]) { d = k; break; }
+    }
+    if (d >= 0) { cur = d; hit = true; i += 3; continue; }
+    if (i + 3 <= s.length() && s.substring(i, i + 3) == "十") {
+      total += (cur ? cur : 1) * 10; cur = 0; hit = true; i += 3; continue;
+    }
+    if (i + 3 <= s.length() && s.substring(i, i + 3) == "百") {
+      total += (cur ? cur : 1) * 100; cur = 0; hit = true; i += 3; continue;
+    }
+    if (hit) break;
+    i++;
+  }
+  return hit ? (total + cur) : -1;
+}
+
+// 进度口令解析：返回 1=绝对秒(sec)，2=相对偏移(delta)，0=不是进度口令
+static int mLibSeekQuery(const String& t, float& outSec, float& outDelta) {
+  long n = mLibParseNum(t);
+  if (n < 0) return 0;
+  float mult = 1;
+  if (t.indexOf("小时") >= 0) mult = 3600;
+  else if (t.indexOf("分钟") >= 0 || t.indexOf("分") >= 0) mult = 60;
+  float val = (float)n * mult;
+  bool absMode = (t.indexOf("跳到") >= 0 || t.indexOf("定位到") >= 0
+                  || t.indexOf("从第") >= 0 || t.indexOf("到第") >= 0
+                  || t.indexOf("开始播") >= 0 || t.indexOf("开始放") >= 0
+                  || t.indexOf("播到") >= 0);
+  bool back = (t.indexOf("后退") >= 0 || t.indexOf("倒退") >= 0 || t.indexOf("退回") >= 0
+               || t.indexOf("往前") >= 0 || t.indexOf("往回") >= 0
+               || t.indexOf("快退") >= 0 || t.indexOf("倒回") >= 0);
+  bool fwd = (t.indexOf("快进") >= 0 || t.indexOf("前进") >= 0
+              || t.indexOf("往后") >= 0 || t.indexOf("跳过") >= 0);
+  if (!absMode && !back && !fwd) return 0;
+  if (absMode) { outSec = val; return 1; }
+  outDelta = back ? -val : val;
+  return 2;
+}
+
+// WiFi 信号分档 + 能直接念给用户的结论与建议（小智据此判断「信号好不好」）
+static String mLibSignalText() {
+  if (WiFi.status() != WL_CONNECTED) return "WiFi 未连接，设备当前离线，媒体库暂时取不到流";
+  int r = WiFi.RSSI();
+  String lv;
+  if (r >= -55) lv = "很好（满格）";
+  else if (r >= -65) lv = "良好（3 格）";
+  else if (r >= -75) lv = "一般（2 格）";
+  else lv = "较差（1 格）";
+  String s = String("WiFi 信号 ") + r + " dBm，" + lv + "，已连接「" + WiFi.SSID() + "」";
+  if (r < -70)
+    s += "。信号偏弱，听书可能偶有卡顿，建议把设备靠近路由器、避开金属遮挡或换 2.4G 信道";
+  else if (r < -60) s += "。基本稳定，偶发卡顿多来自服务端或网络抖动";
+  else s += "。信号充足，卡顿基本与 WiFi 无关";
+  return s;
+}
+
+// 执行跳转：同一集用 &ss=<目标秒> 原地重开一条流（服务端输入侧 -ss 快速定位）
+static String mLibDoSeek(bool hasSec, float sec, bool hasDelta, float delta) {
+  if (!mLibKind) return "当前没有在播放，无法调进度";
+  if (mLibKind == 2) return "电台是直播流，不能调进度";
+  if (mLibKind != 3) return "歌单暂不支持调进度，可以说「下一首」";
+  float target = hasSec ? sec : (mLibNowSec() + delta);
+  if (mLibDur > 0) {
+    // ★别落在文件外：-ss 超出时长 ⇒ ffmpeg 零字节 ⇒ 设备「嘀一声没声」（v1.6.3 踩过）
+    float cap = (float)mLibDur - 3;
+    if (cap < 0) cap = 0;
+    if (target > cap) target = cap;
+  }
+  if (target < 0) target = 0;
+  // ★MCP 路径等云端那句确认语说完再起播（V2.4.8 的 ttsSeq 轮次判据）；
+  //   STT 兜底路径已经 abort 云端，不等，否则白挂 500ms。
+  bool wait = mLibMcpReady;
+  // mLibStop() 内部会把「这一刻听到哪」排进 /ap/pos 上报队列，这里不必重复排
+  mLibPlayStream(3, mLibQ, mLibPos, wait, target, wait);
+  String r = "已跳到 " + mLibFmtSec(target);
+  if (mLibDur > 0) r += "（本集共 " + mLibFmtSec((float)mLibDur) + "）";
+  return r;
+}
+
+// STT 文本的本地兜底入口（**仅当服务器没做 MCP 握手时**才走到这里）：
+// 返回 true = 这句话已被本机处理，不要再交给云端
+static bool mLibHandleText(const String& t) {
+  if (mLibMcpReady) return false;   // 云端能调工具：交给 LLM 判断，避免一次请求触发两遍
+  int kind = mLibCmdKind(t);
+  if (kind) {
+    mLibOn = (kind == 1);
+    mLibSave();
+    if (mLibState) mLibStop("开关切换");
+    if (wsReady) sendAbort();   // 云端不知道这个开关，让它答只会答错
+    Serial.printf("[LIB] 指令「%s」→ 我的媒体库 %s\n", t.c_str(),
+                  mLibOn ? "已启用（点歌默认走自建库）" : "已关闭（点歌交还云端）");
+    mLibBeep(mLibOn);
+    return true;
+  }
+  if (!mLibOn) return false;
+  // ★V2.4.12：进度口令（「快进五分钟」「后退三十秒」「跳到第十分钟」）。
+  //   与 MCP 两路互斥：mLibMcpReady 时本函数直接 return false，口令交给云端工具。
+  {
+    float s = 0, d = 0;
+    int sk = mLibSeekQuery(t, s, d);
+    if (sk) {
+      if (wsReady) sendAbort();
+      String res = mLibDoSeek(sk == 1, s, sk == 2, d);
+      Serial.printf("[LIB] 进度口令「%s」→ %s\n", t.c_str(), res.c_str());
+      mLibBeep(true);
+      return true;
+    }
+  }
+  String q;
+  if (!mLibSongQuery(t, q)) return false;
+  Serial.printf("[LIB] 点歌意图：「%s」→ 关键词「%s」\n", t.c_str(), q.c_str());
+  if (wsReady) sendAbort();   // 立刻掐云端（它会先答一句"我没有音乐"）
+  mLibPlayQuery(q);
+  return true;
+}
+
+// ---------- 设备侧 MCP（小智 {"type":"mcp","payload":{...}}，与 R1 客户端同款）----------
+// 场景：服务器连上就问 initialize / tools/list，把设备能力登记进 LLM 的工具表；
+// 之后用户说「启用我的媒体库」「播放晴天」，云端直接调 tools/call 到这里。
+// 相比 STT 关键字，这条路的意图识别在**云端 LLM**，不用我们猜句子结构。
+// 报文（照 R1 客户端 XiaoZhiWs.smali）：
+//   收 {"type":"mcp","payload":{"id":1,"method":"tools/call","params":{"name":"...","arguments":{...}}}}
+//   回 {"type":"mcp","payload":{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"..."}],"isError":false}}}
+
+// 取嵌套对象段（带花括号配对）。jsonSection 只找第一个 '}'，遇到 arguments 这种
+// 嵌套对象会被截断，所以 MCP 解析统一用这个。
+static String jsonObj(const String& s, const char* key) {
+  String pat = String("\"") + key + "\":";
+  int i = s.indexOf(pat);
+  if (i < 0) return "";
+  i += (int)pat.length();
+  while (i < (int)s.length() && s[i] == ' ') i++;
+  if (i >= (int)s.length() || s[i] != '{') return "";
+  int depth = 0;
+  bool inStr = false, esc = false;
+  for (int j = i; j < (int)s.length(); j++) {
+    char c = s[j];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') inStr = false;
+      continue;
+    }
+    if (c == '"') inStr = true;
+    else if (c == '{') depth++;
+    else if (c == '}') {
+      depth--;
+      if (depth == 0) return s.substring(i, j + 1);
+    }
+  }
+  return "";
+}
+
+// 取布尔字段（找不到返回 false，用 out 带值）
+static bool jsonBool(const String& s, const char* key, bool& out) {
+  String pat = String("\"") + key + "\":";
+  int i = s.indexOf(pat);
+  if (i < 0) return false;
+  i += (int)pat.length();
+  while (i < (int)s.length() && s[i] == ' ') i++;
+  if (i < (int)s.length() && s[i] == 't') { out = true;  return true; }
+  if (i < (int)s.length() && s[i] == 'f') { out = false; return true; }
+  return false;
+}
+
+// JSON 字符串值转义（中文按 UTF-8 原样过，只处理引号/反斜杠/控制字符）
+static String mcpEsc(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') {
+      o += '\\';
+      o += c;
+    } else if ((uint8_t)c < 0x20) {
+      o += ' ';
+    } else {
+      o += c;
+    }
+  }
+  return o;
+}
+
+static void mcpSend(const String& payloadJson) {
+  if (!wsReady) return;
+  String m = "{\"type\":\"mcp\",\"payload\":" + payloadJson + "}";
+  ws.sendTXT(m);
+  if (dlVerbose) Serial.println("[MCP] -> " + m);
+}
+
+static void mcpResult(int id, const String& text, bool isErr) {
+  mcpSend("{\"jsonrpc\":\"2.0\",\"id\":" + String(id)
+          + ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" + mcpEsc(text)
+          + "\"}],\"isError\":" + (isErr ? "true" : "false") + "}}");
+  Serial.printf("[MCP] <- result id=%d isError=%d：%s\n", id, isErr ? 1 : 0, text.c_str());
+}
+
+// 工具表。★V2.2.1：描述从 1.5KB 压到 ~0.6KB。
+//   为什么必须压：每次按住说话都会**新建会话**，服务器每次都重新 initialize +
+//   tools/list，这 1.5KB schema 会进 LLM 的每一次推理 —— 官方服务器实测首字延迟
+//   明显变大，用户听感就是"说话卡卡的"。触发词留全，解释性文字全删。
+static const char* MCP_TOOLS =
+    "{\"tools\":["
+    "{\"name\":\"self.stem.media_library\","
+    "\"description\":\"开关设备自建曲库。on=true 启用（之后点歌走自建库），false 关闭，不传=查询。"
+    "用户说「启用/关闭我的媒体库（曲库）」时调用。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"on\":{\"type\":\"boolean\"}}}},"
+    "{\"name\":\"self.stem.play_song\","
+    "\"description\":\"从自建曲库放歌，可连续播多首。用户要听某首歌、某歌手、某个类型的歌时用它，"
+    "不要用云端音乐搜索。keyword 传歌名或歌手原句。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"keyword\":{\"type\":\"string\"}},"
+    "\"required\":[\"keyword\"]}},"
+    "{\"name\":\"self.stem.play_radio\","
+    "\"description\":\"播放网络电台/广播。用户说「放XX电台」「听广播」「听新闻台」时用它；"
+    "name 传台名（如「中国之声」），不必报网址。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},"
+    "\"required\":[\"name\"]}},"
+    "{\"name\":\"self.stem.play_book\","
+    "\"description\":\"播放有声书/评书/相声。用户说「听XX」「放某本书」时用它；keyword 传书名，"
+    "episode 传集号（用户没点名就省略，从上次听到的那集续播）。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"keyword\":{\"type\":\"string\"},"
+    "\"episode\":{\"type\":\"integer\"}},\"required\":[\"keyword\"]}},"
+    "{\"name\":\"self.stem.next_play\","
+    "\"description\":\"下一首/下一集。用户说「下一首」「换一个」「下一集」「跳过这首」时调用。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+    "{\"name\":\"self.stem.current_play\","
+    "\"description\":\"查询当前播放内容与进度（歌名歌手 / 书名集数 / 电台台名）。"
+    "问「现在放的是什么」「这集多长」「播到哪了」「还剩多久」时调用。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+    "{\"name\":\"self.stem.seek_play\","
+    "\"description\":\"调整有声书进度。说「跳到第N秒/第N分钟」「从第N分钟开始播」传 sec（绝对秒）；"
+    "说「快进/后退N秒(分钟)」传 delta（秒，正数快进负数后退，中文数量请换算成秒）。"
+    "都不传则只查询当前进度。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"sec\":{\"type\":\"number\"},"
+    "\"delta\":{\"type\":\"number\"}}}},"
+    "{\"name\":\"self.stem.signal_status\","
+    "\"description\":\"查询设备 WiFi 信号强度与好坏结论。问「信号好不好」「网络怎么样」「怎么老卡」时调用。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
+    "{\"name\":\"self.stem.stop_play\","
+    "\"description\":\"停止当前播放。用户说「停」「别放了」「安静」「关掉音乐」时调用。\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}"
+    "]}";
+
+// 三个播放工具共用的前置校验（★V2.2.1 教训：宁可回"没配地址"，也绝不能谎报成功 ——
+// 谎报会让云端照着说"已经帮你放啦"，而实际响的是它自己 search_music 搜来的版本）
+static bool mLibReadyOrSay(int id) {
+  if (!mLibOn) {
+    mcpResult(id, "我的媒体库未启用：先调用 self.stem.media_library 并传 on=true", true);
+    return false;
+  }
+  if (!mLibHostNow().length()) {
+    mcpResult(id, "媒体库地址还没配置，现在放不了。请让用户在设备配网门户"
+                  "「我的媒体库」里填 NAS 的 IP（端口默认 8100）后再试。", true);
+    Serial.println("[LIB] 播放被拒：媒体库地址未配置（连官方服务器时无法自动推断）");
+    return false;
+  }
+  return true;
+}
+
+static void mcpHandle(const String& msg) {
+  String payload = jsonObj(msg, "payload");
+  if (!payload.length()) return;
+  int id = jsonInt(payload, "id");
+  if (id < 0) return;                       // 通知类报文（无 id）不需要回
+  String method = jsonStr(payload, "method");
+
+  if (method == "initialize") {
+    mLibMcpReady = true;
+    mcpSend("{\"jsonrpc\":\"2.0\",\"id\":" + String(id)
+            + ",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},"
+              "\"serverInfo\":{\"name\":\"alphapi-stem\",\"version\":\"2.4.13\"}}}");
+    Serial.println("[MCP] initialize ✅（设备工具：媒体库开关 / 点歌单 / 电台 / 有声书 / 下一个 / 正在播放 / 停止）");
+    return;
+  }
+  if (method == "tools/list") {
+    mLibMcpReady = true;
+    mcpSend("{\"jsonrpc\":\"2.0\",\"id\":" + String(id) + ",\"result\":" + MCP_TOOLS + "}");
+    Serial.println("[MCP] tools/list → media_library / play_song / play_radio / play_book / next_play / current_play / seek_play / signal_status / stop_play");
+    return;
+  }
+  if (method != "tools/call") {
+    Serial.printf("[MCP] 忽略未支持的方法：%s\n", method.c_str());
+    return;
+  }
+
+  String params = jsonObj(payload, "params");
+  String name = jsonStr(params, "name");
+  String args = jsonObj(params, "arguments");
+
+  if (name == "self.stem.media_library") {
+    bool want = false;
+    if (!jsonBool(args, "on", want)) {   // 只查询
+      mcpResult(id, String("我的媒体库当前") + (mLibOn ? "已启用，点歌走自建曲库" : "已关闭，点歌交还云端"), false);
+      return;
+    }
+    if (want != mLibOn) {
+      mLibOn = want;
+      mLibSave();
+      if (!mLibOn) {          // 关库即停：否则正在播的歌会继续放，和云端那句"已关闭"自相矛盾
+        mLibPendingQuery = "";
+        if (mLibState) mLibStop("工具关闭媒体库");
+        if (dlActive) stopDlPlayHard();
+      }
+      // ★这里**不播提示音**：MCP 路径下云端本来就会说"已启用/已关闭"，
+      //   播提示音等于把服务端那句话拦腰截断（提示音只在 STT 兜底路径用，那条已 abort 云端）。
+    }
+    mcpResult(id, mLibOn ? "我的媒体库已启用，之后点歌默认走自建曲库" : "我的媒体库已关闭，点歌交还云端", false);
+    return;
+  }
+
+  if (name == "self.stem.play_song") {
+    String q = jsonStr(args, "keyword");
+    if (!q.length()) {
+      mcpResult(id, "缺少 keyword（歌名或歌手）", true);
+      return;
+    }
+    if (!mLibReadyOrSay(id)) return;
+    // ★V2.4.1 抢跑：工具一回就把请求挂出去（loop 下一圈立刻取流），
+    //   起播等云端确认语说完（见 loop 里的 mLibPendingQuery + mLibTick 的 canStart）
+    mLibPendingKind = 1;
+    mLibPendingPos = 0;
+    mLibPendingQuery = q;
+    mLibPendingAt = millis();
+    mcpResult(id, "已从自建曲库取「" + q + "」，马上播放", false);
+    return;
+  }
+
+  if (name == "self.stem.play_radio") {
+    String n = jsonStr(args, "name");
+    if (!n.length()) n = jsonStr(args, "keyword");
+    if (!n.length()) {
+      mcpResult(id, "缺少 name（台名，例如「中国之声」）", true);
+      return;
+    }
+    if (!mLibReadyOrSay(id)) return;
+    mLibPendingKind = 2;
+    mLibPendingPos = 0;
+    mLibPendingQuery = n;
+    mLibPendingAt = millis();
+    mcpResult(id, "正在打开电台「" + n + "」", false);
+    return;
+  }
+
+  if (name == "self.stem.play_book") {
+    String q = jsonStr(args, "keyword");
+    if (!q.length()) q = jsonStr(args, "name");
+    if (!q.length()) {
+      mcpResult(id, "缺少 keyword（书名）", true);
+      return;
+    }
+    if (!mLibReadyOrSay(id)) return;
+    int ep = jsonInt(args, "episode");
+    mLibPendingKind = 3;
+    mLibPendingPos = (uint16_t)(ep > 0 ? ep : 0);   // 0 = 续播（服务端按上次那集）
+    mLibPendingQuery = q;
+    mLibPendingAt = millis();
+    mcpResult(id, ep > 0 ? ("正在打开《" + q + "》第 " + String(ep) + " 集")
+                         : ("正在从上次听到的位置打开《" + q + "》"), false);
+    return;
+  }
+
+  if (name == "self.stem.next_play") {
+    if (!mLibKind) {
+      mcpResult(id, "当前没有在播的歌或有声书", true);
+      return;
+    }
+    if (mLibKind == 2) {
+      mcpResult(id, "电台是直播流，没有下一首；可以换一个台，或者说停", true);
+      return;
+    }
+    bool isSong = (mLibKind == 1);
+    mLibNext(true);
+    mcpResult(id, isSong ? "已跳到下一首" : "已跳到下一集", false);
+    return;
+  }
+
+  if (name == "self.stem.current_play") {
+    // ★V2.4.10：信息来自服务端 X-Media-Title（歌名-歌手 / 书名·演播·第N集 / 台名）。
+    // ★V2.4.12：有声书再答总时长 / 已播到 / 还剩，小智能直接回答「这集多长」「还剩多久」。
+    if (!mLibKind) {
+      mcpResult(id, "现在没有在播放", false);
+      return;
+    }
+    const char* kn = (mLibKind == 3) ? "有声书" : (mLibKind == 2 ? "电台" : "歌曲");
+    String t = mLibNowTitle.length() ? mLibNowTitle : mLibCurTitle;
+    String extra;
+    if (mLibKind == 3) {
+      float now = mLibNowSec();
+      extra = String("（第 ") + mLibPos + " 集";
+      if (mLibDur > 0) extra += "，总时长 " + mLibFmtSec((float)mLibDur);
+      extra += "，已播到 " + mLibFmtSec(now);
+      if (mLibDur > 0) extra += "，还剩 " + mLibFmtSec((float)mLibDur - now);
+      if (mLibPaused) extra += "，已暂停";
+      extra += "）";
+    } else if (mLibPaused) extra = "（已暂停）";
+    mcpResult(id, String("正在播放") + kn + "：" + t + extra, false);
+    return;
+  }
+
+  if (name == "self.stem.seek_play") {
+    float sec = 0, delta = 0;
+    bool hasSec = mLibJsonNum(args, "sec", sec);
+    bool hasDelta = mLibJsonNum(args, "delta", delta);
+    if (!hasSec && !hasDelta) {          // 只问进度，不跳转
+      if (!mLibKind) { mcpResult(id, "现在没有在播放", false); return; }
+      String r = "已播到 " + mLibFmtSec(mLibNowSec());
+      if (mLibKind == 3 && mLibDur > 0)
+        r += String("，本集共 ") + mLibFmtSec((float)mLibDur)
+           + "，还剩 " + mLibFmtSec((float)mLibDur - mLibNowSec());
+      mcpResult(id, r, false);
+      return;
+    }
+    mcpResult(id, mLibDoSeek(hasSec, sec, hasDelta, delta), false);
+    return;
+  }
+
+  if (name == "self.stem.signal_status") {
+    mcpResult(id, mLibSignalText(), false);
+    return;
+  }
+
+  if (name == "self.stem.stop_play") {
+    mLibPendingQuery = "";
+    if (mLibState) mLibStop("工具停止");
+    if (dlActive) stopDlPlayHard();
+    if (wsReady) sendAbort();
+    mcpResult(id, "已停止播放", false);
+    return;
+  }
+
+  mcpResult(id, "未知工具：" + name, true);
+}
+
+
 static void handleText(uint8_t* payload, size_t len) {
   String msg;
   msg.reserve(len);
@@ -2776,7 +4529,20 @@ static void handleText(uint8_t* payload, size_t len) {
     if (sr > 0) rebuildDecoder(sr);
     else Serial.printf("[DL] hello 未含 sample_rate，解码器沿用 %dHz\n", decRate);
   } else {
+    // ★V2.4.0 设备侧 MCP：initialize / tools/list / tools/call
+    if (hasMsgType(msg, "mcp")) { mcpHandle(msg); return; }
+    // ★V2.4.0 我的媒体库 STT 兜底：只在服务器没做 MCP 握手时生效（两路互斥）
+    if (hasMsgType(msg, "stt") && !mLibMcpReady) {
+      String stt = jsonStr(msg, "text");
+      if (stt.length() && mLibHandleText(stt)) return;
+    }
     Serial.println("[SRV] " + msg);
+    if (mLibWaitTts) {
+      // ★V2.4.8：只有"服务器真在生成回答"才算在说话的路上。以前是"任何文本都算"，
+      //   情绪/附带字段一来就白等 6s —— 用户口径是没动静 0.5s 就该出声。
+      String t = jsonStr(msg, "text");
+      if (t.length()) mLibSawReply = true;
+    }
     // tts start/stop 精确匹配（"state":"start" 不会误中 "sentence_start"）：
     // stop=流结束协议判据（pumpPlay 据此收尾，替代旧的空闲硬猜）
     if (msg.indexOf("\"type\":\"tts\"") >= 0) {
@@ -2786,6 +4552,7 @@ static void handleText(uint8_t* payload, size_t len) {
         dlRespOpen = false;  // 响应正常收尾
       } else if (msg.indexOf("\"state\":\"start\"") >= 0) {
         ttsDone = false;
+        ttsSeq++;            // ★V2.4.7：本轮确认语开口（本地点播靠它判断"该等的是哪一轮"）
         dlRespOpen = true;   // ★V2.0.9：响应开始，等 stop 才算收尾（断开定责用）
         dlBarged = false;  // 新一轮 TTS = 解除打断封锁（旧响应残帧到此为止）
         mtxMusic = false;  // 新一轮响应：点歌标记复位（点阵回三角/音符由 startDlPlay 决定）
@@ -2856,7 +4623,9 @@ static void wsEvent(WStype_t type, uint8_t* payload, size_t len) {
                         (unsigned long)dlSentTotal,
                         (unsigned long)(millis() - dlLastAudioAt),
                         wsLastRxAt ? (unsigned long)(millis() - wsLastRxAt) : 0UL);
-          dlBroken = true;  // ★V2.1.0：交给 endDlPlay 打"失望脸"（收场那刻总线才空闲）
+          // ★V2.4.3：本地媒体库播放中 ws 被踢是**正常现象**（播放期无上行，服务器约 80s
+          //   断开会话），不是"响应未完成"，别打失望脸 —— 否则用户会以为音频流挂了。
+          if (!mLibState) dlBroken = true;  // ★V2.1.0：交给 endDlPlay 打"失望脸"（收场那刻总线才空闲）
         }
       }
       // ★V2.1.2 诊断：断开瞬间的内存水位。判据 —— 若"本会话最大帧 + 1" > "最大连续块"，
@@ -3177,6 +4946,14 @@ static void cfgSendPage(const String& msg = "") {
   }
   h += "<p class='v'>Device-Id: <code>" + mac + "</code><br>"
        "信号: " + String(WiFi.RSSI()) + " dBm · 堆: " + String(ESP.getFreeHeap() / 1024) + " KB</p>";
+  // ★V2.4.10：正在播放（X-Media-Title）—— 歌名歌手 / 书名演播集题 / 台名
+  if (mLibKind) {
+    const char* kn = (mLibKind == 3) ? "有声书" : (mLibKind == 2 ? "电台" : "歌曲");
+    h += String("<p class='v'>正在播放") + kn + ": <b>"
+         + escHtml(mLibNowTitle.length() ? mLibNowTitle : mLibCurTitle) + "</b>"
+         + (mLibKind == 3 ? (String("（第 ") + mLibPos + " 集）") : "")
+         + (mLibPaused ? " · 已暂停" : "") + "</p>";
+  }
   String actStatus;
   if (gActCode == "(已激活)") {
     actStatus = "<p>状态: <b style='color:#2a7'>已激活</b>（本地缓存）</p>"
@@ -3465,7 +5242,16 @@ static void enterDeepSleep() {
 
 static void sleepTick() {
   if (SLEEP_IDLE_MS == 0) return;
-  if (dlActive || recPhase != 0 || cfgMode) return;   // 播放/录音/配网：绝不睡
+  // ★V2.4.5：本地播放期间（媒体库取流 mLibState / FIFO 播放泵 dlActive）既不许睡，
+  //   **也不许"空闲钟"继续走表**。
+  //   用户实测：一集 11 分钟播完的**那一瞬间**就自动深睡了 —— 因为 lastConvAt 还停在
+  //   上次说话的时刻（早就超过 60s），dlActive 一落（FIFO 播空）就立刻满足进睡条件。
+  //   这里播放期间持续把基准推到"当下" ⇒ 播完那刻重新开始数 60s。
+  if (mLibState || dlActive) {
+    lastConvAt = millis();
+    return;
+  }
+  if (recPhase != 0 || cfgMode) return;      // 录音/配网：绝不睡（也不动空闲钟）
   uint32_t ref = (lastConvAt > lastVolActAt) ? lastConvAt : lastVolActAt;
   if (millis() - ref < SLEEP_IDLE_MS) return;
   enterDeepSleep();
@@ -3536,6 +5322,10 @@ void setup() {
   wifiSsid = prefs.getString("ssid", WIFI_SSID);
   wifiPass = prefs.getString("pass", WIFI_PASS);
   gActCode = prefs.getString("actcode", "");
+  // ★V2.4.0 我的媒体库（cfg 命名空间，烧录不擦 NVS ⇒ 升级后配置保留）
+  mLibOn = prefs.getBool("mlon", false);
+  mLibHost = prefs.getString("mlhost", "");
+  mLibPort = prefs.getUShort("mlport", 8100);
   prefs.end();
 
   // ★★全新设备判定（V2.0.4）：WiFi 凭据为空 = 设备从未配过网 = 出厂状态。
@@ -3683,6 +5473,15 @@ void loop() {
   pollButton();
   pollBtnA();  // A 键长按 2s 切换 AP 配网门户开/关（STA 不受影响，图标提醒）
   mtxFlush();  // 点阵意图补发（内部判总线空闲+熔断，忙时零开销返回）
+  mLibTick();  // ★V2.4.0 媒体库取流泵（空闲时立即返回）
+  mLibPosTick();  // ★V2.4.6 到点把「播到第几秒」报给媒体库（队列空时立即返回）
+  if (mLibPendingQuery.length()) {   // 抢跑：工具一调用就发请求，起播等云端说完
+    String q = mLibPendingQuery;
+    uint8_t kd = mLibPendingKind;
+    uint16_t ps = mLibPendingPos;
+    mLibPendingQuery = "";
+    if (mLibOn) mLibPlayStream(kd, q, ps, true);
+  }
   // ★V2.2.3：音量落盘推迟到空闲（NVS 提交会卡 10~40ms，播放中写 flash 就是一次断流）。
   // 图标 1.5s 后的恢复动作已交给泵任务（播放中也走非阻塞快速路径）。
   if (volSaveDirty && !dlActive && recPhase == 0 && millis() - volSaveAt > 800) {
@@ -3829,6 +5628,17 @@ void loop() {
       Serial.printf("[SRV] ready=%d rec=%u play=%d | 解码器 %dHz | 下行丢帧=%lu 溢出=%lu 解码错=%lu\n",
                     wsReady, recPhase, dlActive, decRate,
                     (unsigned long)dlDropped, (unsigned long)dlOver, (unsigned long)dlDecErr);
+    } else if (c == 'm') {   // 我的媒体库：打印状态 + 切开关（NVS 持久化）
+      static const char* kn[] = {"空闲", "歌单", "电台", "有声书"};
+      Serial.printf("[LIB] 媒体库 %s | 目标 %s:%u | 状态 %u | 当前 %s「%s」pos=%u 本批 %u 首\n",
+                    mLibOn ? "开" : "关",
+                    mLibHostNow().length() ? mLibHostNow().c_str() : "(未配置)", mLibPort,
+                    mLibState, kn[mLibKind > 3 ? 0 : mLibKind], mLibQ.c_str(),
+                    (unsigned)mLibPos, (unsigned)mLibTracks);
+      mLibOn = !mLibOn;
+      mLibSave();
+      if (!mLibOn && mLibState) mLibStop("串口关闭");
+      Serial.printf("[LIB] 已%s（串口切换，NVS 已存）\n", mLibOn ? "启用" : "关闭");
     } else if (c == 'h') {
       if (wsReady) sendHello();
       else Serial.println("[WS] 未握手");
