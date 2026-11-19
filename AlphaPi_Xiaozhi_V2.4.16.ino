@@ -1,5 +1,25 @@
 /*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2026 shj4588. Licensed under the GNU Affero General Public License v3.0
+ * (全文见同目录 LICENSE；改后分发 / 对外提供网络服务须以 AGPL 公开源码)。
+ * 第三方依赖与来源（LGPL-2.1 core、BSD libopus、MIT 的 78/xiaozhi-esp32 协议参考）见 THIRD_PARTY_NOTICES.md。
+ *
  * AlphaPi_Xiaozhi —— STEM 板（ESP32-C3）极简小智 AI 客户端
+ *
+ * V2.4.14（2026-11-15 傍晚）：**播放记录上报对齐统一进度中枢（服务端 v1.7.21）**。
+ *   背景：媒体库记录链路本身没断（/ap/pos 结算/心跳、/ap/play 落账都在），
+ *   但新版服务端把「播放记录能认出是谁播的」升级成了统一设备列表（R1 走 /v1/pos
+ *   带 devId/devName）。stem 这边有两处没跟上：
+ *   ① 位置上报 / 事件上报的请求头**只有 X-Dev-Mac 没有 X-Dev-Name**（只有起播那条带）
+ *      ⇒ 服务端设备名单靠老记录的名字撑着，认不全。
+ *   ② 结算上报（暂停/播完/打断）连接失败就**直接丢弃**——恰好断在「用户按了暂停」
+ *      这个最值得记的时刻，这条记录就永远丢了。
+ *   修法：
+ *   ① mLibPosTick / mLibLog 的请求头补 `X-Dev-Name`（与起播同款身份标识）；
+ *   ② 结算类上报（非心跳）connect 失败改为**延迟 3s 重试一次**（只重试一次，绝不堵播放），
+ *      心跳照旧丢弃（下一拍自然会再报）；
+ *   ③ 配套：服务端 v1.7.21 起 /ap/pos 的结算与心跳都会刷新统一设备列表
+ *      （histDevTouch，同书同集原地更新），播放记录里 stem 与 R1 同列。
  *
  * V2.4.13（2026-11-12 凌晨）：**修「跳到集尾不接下一集，反而倒回 28 秒重播本集」**。
  *   ★实机：第 8 集 dur=771s，用户「跳到第十二分钟」(720s) 播到集尾后，服务端日志反复
@@ -86,6 +106,22 @@
  *     知道播到哪。服务端收到后就锁死这条记录（devsync），不再用字节数改写。
  *   ★上报走**队列 + 延迟发送**：不在 mLibStop 里同步发（说话那一刻不能堵 800ms），
  *     而是排队，等播放泵把 FIFO 收尾（或暂停静音）后再发，超时/连不上就丢弃。
+ *
+ * V2.4.15（2026-11-15 晚）：**等头超时重试（自动续播黑洞修复）**。
+ *   ★串口实锤：自动续播的请求握手+请求都到达服务端，之后这条 TCP 两个方向全被黑洞
+ *     （服务端发出 480B 设备收 0 B；设备 FIN 服务端也收不到 → 服务端 60s 才中止），
+ *     而同时刻同服务器的 /ap/pos 心跳照常成功。疑似旧流刚关立刻重连时 lwIP 旧 PCB/
+ *     端口复用错配。实测规律：拆掉重连必成。
+ *   ★修法：自动续播等头 8s 判死（正常首字节 2~3s）→ 整条拆掉 → 800ms 后原地重试同一
+ *     请求（最多 2 次，继承自动续播身份=失败仍安静）；手动请求保持 15s 超时、同样可重试。
+ *     仍失败才嘀一声收场。用户说话/说停会取消待办（mLibStop 清 mLibHdrRetryAt）。
+ *
+ * V2.4.16（2026-11-15 深夜）：**服务端转有声书时图标跟着纠正**。
+ *   ★现象：小智 LLM 把「继续播放凡人修仙传」路由成点歌（play_song），固件 mLibKind=1
+ *     发 kind=song 请求；服务端 v1.7.25 兜底发现 q 精确命中书架 → 内部转 kind=book
+ *     正确续播了书，但固件不知道 —— 播的是书、屏幕图标却是音符（音乐）。
+ *   ★修法：响应头里出现 X-Book-Ep（只有 book 分支会发）⇒ mLibKind 强制纠正为 3
+ *     （有声书），下一拍图标刷新就是书图案。一行根治，不影响正常点歌/电台。
  *
  * V2.4.5（2026-11-11 夜）：**有声书自动续播 + 播完重新计空闲**。
  *   ★自动续播：一集真播完（服务端 EOF，不是被打断）后，等 FIFO 里剩下的音频播空
@@ -329,7 +365,7 @@
 
 // ================== 固件版本（唯一出处）==================
 // ★升版本只改这一行：AP 配置页标题 + 串口启动横幅都由它渲染，避免漏改。
-#define XZ_FW_VERSION "V2.4.13"
+#define XZ_FW_VERSION "V2.4.16"
 // 实验版识别标记（正式版留空字符串 ""）：同一处渲染 —— 烧进去后一眼能认版本。
 #define XZ_FW_TAG ""
 
@@ -989,12 +1025,25 @@ static bool  mLibUserStop = false;// 本次收场是用户主动（按 C / 说�
 static uint32_t mLibAutoAt = 0;   // 计划续播的时刻（millis）
 static bool mLibAutoReq = false;  // 当前这条请求是自动续播发的（失败就安静收场，别报警）
 static bool mLibAutoGo = false;   // 载体：mLibPlayStream 开头会 mLibStop（清上面那个），用它带进去
+// ★V2.4.15：等响应头超时重试。串口实锤（19:14 复现）：自动续播的请求握手+请求都成功到达
+//   服务端，之后这条 TCP 两个方向全被黑洞（服务端发出 480B 设备收 0 B、设备 FIN 服务端也
+//   收不到），而同一时刻同服务器的 /ap/pos 心跳照常成功 —— 疑似旧流刚关、立刻重连时
+//   lwIP 旧 PCB/端口复用把包错配丢掉。实测规律：**拆掉整条重连必成**（15s~3min 后的
+//   手动/语音重试从不失败）。所以等头超时不再直接放弃：8s 快速判死（正常首字节 2~3s）
+//   → 整条拆掉 → 800ms 后原地重试同一请求（最多 2 次），仍失败才嘀一声收场。
+static uint32_t mLibHdrRetryAt = 0;   // 计划重试的时刻（millis）；0=没有待办
+static uint8_t  mLibHdrRetryN = 0;    // 本次连击已重试次数（上限 2，新请求清零）
+static bool     mLibIsHdrRetry = false; // 载体：mLibPlayStream 开头会清 mLibHdrRetryN，重试路径用它保住计数
+static bool     mLibHdrRetryAuto = false; // 载体：mLibStop 会清 mLibAutoReq，重试路径用它带回去
 // ★V2.4.6：播放位置上报队列（服务端 v1.6.3 只认设备报的 /ap/pos）。
 //   为什么排队而不在 mLibStop 里直接发：`startTalk()` 也会 mLibStop，用户按下 C 就要说话，
 //   不能让一次同步 HTTP（最坏 800ms）堵在那里。所以只记下"报什么"，到点在主循环里发：
 //   暂停/说停 → 立刻可发；本集播完 → 等 FIFO 播空（否则尾巴还没出声就报，位置偏小）。
 static String   mLibRptQ;         // 要上报的书名（快照，之后 mLibQ 可能被换掉）
 static uint16_t mLibRptEp = 0;    // 要上报的集号
+// ★V2.4.14：结算类上报（暂停/播完/打断）connect 失败的重试计数（0/1，入队时清零）——
+//   暂停/播完的位置就是权威账本，丢了这条记录就永远缺一角；心跳丢了无所谓。
+static uint8_t  sRptRetry = 0;
 static float    mLibRptPos = -1;  // 集内绝对位置（秒）；<0 = 队列空
 static float    mLibRptPlay = 0;  // 本次会话实播秒数（老服务端按 sec+起点 结算，兼容用）
 static uint8_t  mLibRptFin = 0;   // 1 = 本集真播完（服务端据此下次续播跳下一集）
@@ -3251,6 +3300,7 @@ static void mLibStop(const char* why) {
   //   mLibPauseAndReport 是"先 mLibStop 再置 true"，顺序上不受影响。
   mLibPaused = false;
   mLibAutoAt = 0;        // ★V2.4.5：任何"停"都取消自动续播（用户说话/说停/按 C 暂停都算）
+  mLibHdrRetryAt = 0;    // ★V2.4.15：同样取消等头超时的重试待办
   mLibAutoReq = false;
   mLibRetryGo = false;   // ★V2.4.10：断流重试同样取消（用户主动停了就不许再自己续）
   mLibNowTitle = "";     // ★V2.4.10：没在播就没有"正在播放"信息
@@ -3375,7 +3425,8 @@ static void mLibLog(const char* tag, const char* msg, long a, long b) {
   if (a >= 0) path += "&a=" + String(a);
   if (b >= 0) path += "&b=" + String(b);
   c.print("GET " + path + " HTTP/1.1\r\nHost: " + host + ":" + String(mLibPort)
-          + "\r\nConnection: close\r\n\r\n");
+          + "\r\nX-Dev-Mac: " + mLibDevMac
+          + "\r\nX-Dev-Name: " + mLibDevName + "\r\nConnection: close\r\n\r\n");  // ★V2.4.14
   uint32_t t0 = millis();
   while (c.connected() && millis() - t0 < 600) { while (c.available()) c.read(); }
   c.stop();
@@ -3395,12 +3446,17 @@ static void mLibQueuePos(float absPos, uint8_t fin, uint32_t delayMs, bool beat)
   mLibRptFin = fin;
   mLibRptBeat = beat;
   mLibRptAt = millis() + delayMs;
+  sRptRetry = 0;             // ★V2.4.14：新一条入队，重试计数清零
   Serial.printf("[LIB] 位置入队%s：第 %u 集 %.0fs%s（%lums 后上报）\n",
                 beat ? "（心跳）" : "", (unsigned)mLibRptEp, absPos,
                 fin ? "（本集播完）" : "", (unsigned long)delayMs);
 }
 
 // 到点把队列里的位置发给媒体库。连不上就丢弃 —— 位置不是关键路径，绝不堵播放。
+// ★V2.4.14：例外 —— 结算类上报（暂停/播完/打断）connect 失败改延迟 3s 重试一次
+//   （只一次），绝不无限重试堵播放；心跳照旧丢弃。
+// ★V2.4.14：请求头补 X-Dev-Name —— 此前只有起播那条带名字，pos 只带 mac，
+//   服务端统一设备列表认不全（v1.7.21 起 /ap/pos 会刷新设备列表）。
 static void mLibPosTick() {
   if (mLibRptPos < 0) return;
   if ((int32_t)(millis() - mLibRptAt) < 0) return;
@@ -3420,9 +3476,21 @@ static void mLibPosTick() {
               + "&fin=" + String((int)mLibRptFin)
               + (beat ? "&beat=1" : "");   // ★V2.4.9：心跳 → 服务端只更新位置
   WiFiClient c;
-  if (!c.connect(host.c_str(), mLibPort, beat ? 200 : 800)) { mLibRptPos = -1; return; }
+  if (!c.connect(host.c_str(), mLibPort, beat ? 200 : 800)) {
+    // ★V2.4.14：结算上报丢不得（暂停/播完的位置就是权威账本），3s 后重试一次；
+    //   重试也失败才真丢。心跳无所谓，直接扔（下一拍自然会再报）。
+    if (!beat && sRptRetry < 1) {
+      sRptRetry++;
+      mLibRptAt = millis() + 3000;
+      Serial.println("[LIB] 位置上报连不上，3s 后重试一次（结算类不丢）");
+      return;
+    }
+    mLibRptPos = -1;
+    return;
+  }
   c.print("GET " + path + " HTTP/1.1\r\nHost: " + host + ":" + String(mLibPort)
-          + "\r\nX-Dev-Mac: " + mLibDevMac + "\r\nConnection: close\r\n\r\n");
+          + "\r\nX-Dev-Mac: " + mLibDevMac
+          + "\r\nX-Dev-Name: " + mLibDevName + "\r\nConnection: close\r\n\r\n");
   uint32_t t0 = millis();
   uint32_t rto = beat ? 100 : 700;
   while (c.connected() && millis() - t0 < rto) { while (c.available()) c.read(); }
@@ -3431,6 +3499,7 @@ static void mLibPosTick() {
                 (unsigned)mLibRptEp, mLibRptPos, mLibRptFin ? "（本集播完）" : "");
   mLibRptPos = -1;
   mLibRptBeat = false;
+  sRptRetry = 0;
 }
 
 // 本次会话**实际播出**的秒数（不含起点偏移）= 已发送量 - 超前量。// ★别用 (now-dlStartAt)/1000 —— 起播前预滚那段并没有放出来，会多算一个 FIFO。
@@ -3523,7 +3592,9 @@ static void mLibPlayStream(uint8_t kind, const String& q, uint16_t pos, bool wai
   mLibBytes = 0;
   mLibAckBase = 0;                 // ★V2.4.11：新的一条流，实播累计从零开始
   mLibDur = 0;                     // ★V2.4.10：本集时长（X-Book-Dur），断流判据用
-  mLibRetryN = 0;                  // ★V2.4.10：新一场，重试计数清零
+  mLibRetryN = 0;                  // ★V2.4.10：新的一场，重试计数清零
+  if (!mLibIsHdrRetry) mLibHdrRetryN = 0;   // ★V2.4.15：等头重试路径保住计数，真·新请求清零
+  mLibIsHdrRetry = false;
   mLibHdrLen = 0;
   mLibHdr[0] = 0;
   mLibChunked = false;
@@ -3571,7 +3642,7 @@ static void mLibPlayStream(uint8_t kind, const String& q, uint16_t pos, bool wai
   }
   String req = "GET " + path + " HTTP/1.1\r\n"
                "Host: " + host + ":" + String(mLibPort) + "\r\n"
-               "User-Agent: AlphaPi-STEM/2.4.13\r\n"
+               "User-Agent: AlphaPi-STEM/" XZ_FW_VERSION "\r\n"
                "X-Dev-Mac: " + mLibDevMac + "\r\n"
                "X-Dev-Name: " + mLibDevName + "\r\n"
                "Connection: close\r\n\r\n";
@@ -3605,6 +3676,21 @@ static bool mLibNext(bool waitTts) {
 // 非阻塞取流泵：等头 → 边收边喂（FIFO 有空间才读 = 天然背压）→ 攒够预滚起播 → 收尾
 static void mLibTick() {
   uint32_t now = millis();
+
+  // ---- ★V2.4.15 等头超时重试：到点整条拆掉原地重连（必须在 !mLibState return 之前） ----
+  if (mLibHdrRetryAt && (int32_t)(now - mLibHdrRetryAt) >= 0) {
+    mLibHdrRetryAt = 0;
+    if (mLibKind && mLibQ.length() && !mLibUserStop && !mLibPaused
+        && WiFi.status() == WL_CONNECTED) {
+      Serial.printf("[LIB] 等头超时重试 %u/2：%s pos=%u ss=%.0fs\n",
+                    (unsigned)mLibHdrRetryN, mLibQ.c_str(), (unsigned)mLibPos,
+                    (double)mLibBaseSec);
+      mLibIsHdrRetry = true;
+      // waitTts 恒 false：等头都超时 8s 了，确认语早说完，不需要再等 ttsDone
+      mLibPlayStream(mLibKind, mLibQ, mLibPos, false, mLibBaseSec);
+      mLibAutoReq = mLibHdrRetryAuto;  // mLibPlayStream→mLibStop 又清了，带回来
+    }
+  }
 
   // ---- ★V2.4.5 有声书自动续播：上一集真播完（服务端 EOF）→ 接下一集 ----
   //   必须放在 `if (!mLibState) return;` **之前**：排这个待办的时候本条流已经收场、
@@ -3656,10 +3742,23 @@ static void mLibTick() {
       hdrDone = true;
     }
     if (!hdrDone) {
-      if (now - mLibStartAt > 15000) {
-        Serial.printf("[LIB] 等响应头超时（已收 %u B）\n", (unsigned)mLibHdrLen);
+      // ★V2.4.15：自动续播 8s 就判死（正常首字节 2~3s；被黑洞的连接等再久也白等，
+      //   实测服务端 60s 都发不出第一个字节）。手动请求保持 15s。
+      uint32_t hdrTo = mLibAutoReq ? 8000 : 15000;
+      if (now - mLibStartAt > hdrTo) {
+        bool wasAuto = mLibAutoReq;    // mLibStop 会清，先 snapshot
+        Serial.printf("[LIB] 等响应头超时（已收 %u B，%lu ms）\n",
+                      (unsigned)mLibHdrLen, (unsigned long)(now - mLibStartAt));
         mLibStop("等头超时");
-        mLibBeep(false);
+        if (mLibHdrRetryN < 2) {
+          mLibHdrRetryN++;
+          mLibHdrRetryAuto = wasAuto;
+          mLibHdrRetryAt = now + 800;  // 留 800ms 给 lwIP 把旧 PCB 收干净
+          Serial.printf("[LIB] 连接疑似被黑洞，%u/2 次重试待办（800ms 后原地重连）\n",
+                        (unsigned)mLibHdrRetryN);
+        } else {
+          mLibBeep(false);
+        }
       }
       return;
     }
@@ -3687,6 +3786,14 @@ static void mLibTick() {
       const char* bep = strstr(low, "x-book-ep:");
       if (bep) {
         uint16_t ep = (uint16_t)atoi(bep + 10);
+        /* ★V2.4.16：LLM 把听书误路由成点歌时，服务端 v1.7.25 会内部转 kind=book
+           正确续播，但固件的 mLibKind 还是 1（歌）—— 播的是书、图标是音符。
+           X-Book-Ep 只有 book 分支会发 ⇒ 见到它就把 kind 纠正成有声书，
+           下一拍图标刷新（mtxSet 播放图案）就是书图案。 */
+        if (mLibKind != 3) {
+          mLibKind = 3;
+          Serial.println("[LIB] 服务端转有声书（X-Book-Ep）→ 图标纠正为书");
+        }
         if (ep && ep != mLibPos) {
           Serial.printf("[LIB] 续播定位：第 %u 集（原请求 pos=%u）\n", (unsigned)ep, (unsigned)mLibPos);
           mLibPos = ep;
